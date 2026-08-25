@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[ "$(uname -s)" = Darwin ] || { printf 'macos-backup can only run on macOS.\n' >&2; exit 1; }
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vedup"
+BACKUP_DIR="$STATE_DIR/macos-preferences/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LEDGER="$STATE_DIR/macos-preferences.list"
+MANIFEST="$BACKUP_DIR/manifest"
+KEYS_FILE=""
+
+if [ "$#" -gt 0 ]; then
+  if [ "$#" -ne 2 ] || [ "$1" != --keys-file ]; then printf 'Usage: bin/macos-backup [--keys-file FILE]\n' >&2; exit 2; fi
+  KEYS_FILE="$2"
+  [ -r "$KEYS_FILE" ] || { printf 'Touched-key manifest is unreadable: %s\n' "$KEYS_FILE" >&2; exit 1; }
+fi
+
+domains=(
+  NSGlobalDomain
+  com.apple.HIToolbox
+  com.apple.symbolichotkeys
+  com.apple.driver.AppleBluetoothMultitouch.trackpad
+  com.apple.AppleMultitouchTrackpad
+  com.apple.driver.AppleBluetoothMultitouch.mouse
+  com.apple.AppleMultitouchMouse
+  com.apple.finder
+  com.apple.desktopservices
+  com.apple.dock
+  com.apple.TextEdit
+)
+
+mkdir -p "$BACKUP_DIR"
+exported_preferences=0
+for domain in "${domains[@]}"; do
+  filename="${domain//\//_}.plist"
+  if defaults export "$domain" "$BACKUP_DIR/$filename" >/dev/null 2>&1; then
+    printf 'user|%s|%s\n' "$domain" "$filename" >> "$MANIFEST"
+    exported_preferences=$((exported_preferences + 1))
+  fi
+done
+
+host_filename=NSGlobalDomain.current-host.plist
+if defaults -currentHost export NSGlobalDomain "$BACKUP_DIR/$host_filename" >/dev/null 2>&1; then
+  printf 'host|NSGlobalDomain|%s\n' "$host_filename" >> "$MANIFEST"
+  exported_preferences=$((exported_preferences + 1))
+fi
+
+if [ -d "$HOME/Library" ]; then
+  library_flag=nohidden
+  if /bin/ls -ldO "$HOME/Library" | awk '{ for (i = 1; i <= NF; i++) if ($i == "hidden") found = 1 } END { exit !found }'; then
+    library_flag=hidden
+  fi
+  printf 'flag|%s|%s\n' "$HOME/Library" "$library_flag" >> "$MANIFEST"
+fi
+
+if [ -n "$KEYS_FILE" ]; then
+  while IFS=$'\t' read -r scope domain key extra; do
+    if [ -z "$scope" ] || [ -z "$domain" ] || [ -z "$key" ] || [ -n "$extra" ]; then
+      printf 'Invalid touched-key entry.\n' >&2
+      exit 1
+    fi
+    existed=0
+    if [ "$key" = __entire_domain__ ]; then
+      defaults export "$domain" - >/dev/null 2>&1 && existed=1
+    elif [ "$scope" = host ]; then
+      defaults -currentHost read "$domain" "$key" >/dev/null 2>&1 && existed=1
+    else
+      defaults read "$domain" "$key" >/dev/null 2>&1 && existed=1
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$scope" "$domain" "$key" "$existed" >> "$BACKUP_DIR/keys.tsv"
+  done < "$KEYS_FILE"
+fi
+
+[ "$exported_preferences" -gt 0 ] || { printf 'Could not export any macOS preference domains.\n' >&2; exit 1; }
+printf '%s\n' "$BACKUP_DIR" >> "$LEDGER"
+printf '[macos] Preference backup: %s\n' "$BACKUP_DIR" >&2
+printf '%s\n' "$BACKUP_DIR"

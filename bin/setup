@@ -1,0 +1,1006 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/apps.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/state.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/choices.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/config.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/dotfiles.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/plan.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/versions.env"
+
+DRY_RUN=0
+WITH_AWS=0
+WITH_DOCKER=0
+WITH_PERSONAL_APPS=0
+DOTFILES_ONLY=0
+SKIP_PLUGINS=0
+VERIFY=1
+CHANGE_SHELL=1
+PROFILE=auto
+APPLY_MACOS_DEFAULTS=auto
+MINIMAL_DOCK=0
+KEYBOARD_SHORTCUTS=0
+EXPERIMENTAL_MACOS_DEFAULTS=0
+VERBOSE=0
+UPGRADE_APPS=0
+OPEN_INTERACTIVE=0
+OPERATION_SCOPE=full
+PARALLEL_JOBS="${VEDUP_JOBS:-4}"
+PROFILE_EXPLICIT=0
+AWS_EXPLICIT=0
+DOCKER_EXPLICIT=0
+PERSONAL_APPS_EXPLICIT=0
+MACOS_DEFAULTS_EXPLICIT=0
+MINIMAL_DOCK_EXPLICIT=0
+KEYBOARD_SHORTCUTS_EXPLICIT=0
+EXPERIMENTAL_DEFAULTS_EXPLICIT=0
+SHELL_EXPLICIT=0
+VEDUP_APPLIED_LINK="${VEDUP_APPLIED_LINK:-${XDG_DATA_HOME:-$HOME/.local/share}/vedup/applied}"
+VEDUP_RELEASE_ROLLBACK_FILE=""
+
+usage() {
+  cat <<'EOF'
+Usage: bin/setup [options]
+
+  --profile auto|server|workstation
+  --with-aws                 Install AWS CLI
+  --without-aws              Keep AWS CLI unselected
+  --with-docker              Install Docker and lazydocker on Linux
+  --without-docker           Keep Docker unselected
+  --with-personal-apps       Install optional macOS applications
+  --without-personal-apps    Keep personal applications unselected
+  --upgrade-apps             Explicitly upgrade selected installed GUI apps
+  --dry-run                  Print actions without changing the machine
+  --verbose                  Stream full command output as well as logging it
+  --jobs NUMBER              Run up to NUMBER safe installation jobs (default: 4)
+  --interactive              Open the friendly guided installer
+  --non-interactive          Explicitly use flags without prompting
+  --macos-defaults           Apply conservative macOS preferences
+  --no-macos-defaults        Do not apply tracked macOS preferences
+  --minimal-dock             Remove pinned Dock apps and show only running apps
+  --no-minimal-dock          Do not change the pinned Dock application list
+  --keyboard-shortcuts       Replace macOS shortcuts with the tracked snapshot
+  --no-keyboard-shortcuts    Do not replace macOS keyboard shortcuts
+  --experimental-macos-defaults
+                              Apply undocumented trackpad and animation settings
+  --no-experimental-macos-defaults
+                              Do not apply undocumented macOS preferences
+  --shell-change             Change the login shell to Zsh
+  --no-shell-change          Do not change the login shell
+  --no-verify                Skip the final doctor check
+  --dotfiles-only            Internal/test mode: link dotfiles only
+  --skip-plugins             Internal/test mode: skip tmux plugin installation
+  --scope full|apps|macos-preferences
+                              Limit execution to an explicit maintenance task
+EOF
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  exec "$REPO_ROOT/bin/install"
+fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --profile) [ "$#" -ge 2 ] || die "--profile requires a value"; PROFILE="$2"; PROFILE_EXPLICIT=1; shift 2 ;;
+    --with-aws) WITH_AWS=1; AWS_EXPLICIT=1; shift ;;
+    --without-aws) WITH_AWS=0; AWS_EXPLICIT=1; shift ;;
+    --with-docker) WITH_DOCKER=1; DOCKER_EXPLICIT=1; shift ;;
+    --without-docker) WITH_DOCKER=0; DOCKER_EXPLICIT=1; shift ;;
+    --with-personal-apps) WITH_PERSONAL_APPS=1; PERSONAL_APPS_EXPLICIT=1; shift ;;
+    --without-personal-apps) WITH_PERSONAL_APPS=0; PERSONAL_APPS_EXPLICIT=1; shift ;;
+    --upgrade-apps) UPGRADE_APPS=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    --jobs) [ "$#" -ge 2 ] || die "--jobs requires a value"; PARALLEL_JOBS="$2"; shift 2 ;;
+    --interactive) OPEN_INTERACTIVE=1; shift ;;
+    --non-interactive) shift ;;
+    --macos-defaults) APPLY_MACOS_DEFAULTS=1; MACOS_DEFAULTS_EXPLICIT=1; shift ;;
+    --no-macos-defaults) APPLY_MACOS_DEFAULTS=0; MACOS_DEFAULTS_EXPLICIT=1; shift ;;
+    --minimal-dock) MINIMAL_DOCK=1; MINIMAL_DOCK_EXPLICIT=1; shift ;;
+    --no-minimal-dock) MINIMAL_DOCK=0; MINIMAL_DOCK_EXPLICIT=1; shift ;;
+    --keyboard-shortcuts) KEYBOARD_SHORTCUTS=1; KEYBOARD_SHORTCUTS_EXPLICIT=1; shift ;;
+    --no-keyboard-shortcuts) KEYBOARD_SHORTCUTS=0; KEYBOARD_SHORTCUTS_EXPLICIT=1; shift ;;
+    --experimental-macos-defaults) EXPERIMENTAL_MACOS_DEFAULTS=1; EXPERIMENTAL_DEFAULTS_EXPLICIT=1; shift ;;
+    --no-experimental-macos-defaults) EXPERIMENTAL_MACOS_DEFAULTS=0; EXPERIMENTAL_DEFAULTS_EXPLICIT=1; shift ;;
+    --shell-change) CHANGE_SHELL=1; SHELL_EXPLICIT=1; shift ;;
+    --no-shell-change) CHANGE_SHELL=0; SHELL_EXPLICIT=1; shift ;;
+    --no-verify) VERIFY=0; shift ;;
+    --dotfiles-only) DOTFILES_ONLY=1; shift ;;
+    --skip-plugins) SKIP_PLUGINS=1; shift ;;
+    --scope) [ "$#" -ge 2 ] || die "--scope requires a value"; OPERATION_SCOPE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+case "$OPERATION_SCOPE" in full|apps|macos-preferences) ;; *) die "Unsupported execution scope: $OPERATION_SCOPE" ;; esac
+
+if [ "$OPEN_INTERACTIVE" = 1 ]; then
+  # macOS still ships Bash 3.2, where expanding a declared-but-empty array
+  # under `set -u` raises an unbound-variable error. Rebuild the positional
+  # arguments instead so the no-flag interactive path is portable.
+  set --
+  [ "$DRY_RUN" = 1 ] && set -- "$@" --dry-run
+  [ "$VERBOSE" = 1 ] && set -- "$@" --verbose
+  [ "$UPGRADE_APPS" = 1 ] && set -- "$@" --upgrade-apps
+  [ "$PARALLEL_JOBS" = 4 ] || set -- "$@" --jobs "$PARALLEL_JOBS"
+  exec "$REPO_ROOT/bin/install" "$@"
+fi
+
+case "$PARALLEL_JOBS" in
+  ''|*[!0-9]*) die "--jobs must be a number from 1 to 8" ;;
+esac
+if [ "$PARALLEL_JOBS" -lt 1 ] || [ "$PARALLEL_JOBS" -gt 8 ]; then
+  die "--jobs must be a number from 1 to 8"
+fi
+
+detect_platform() {
+  IS_WSL=0
+  OS="${VEDUP_TEST_OS:-}"
+  if [ -z "$OS" ]; then
+    case "$(uname -s)" in
+      Darwin) OS=macos ;;
+      Linux) OS=linux ;;
+      *) die "Unsupported operating system: $(uname -s)" ;;
+    esac
+  fi
+
+  ARCH="${VEDUP_TEST_ARCH:-$(uname -m)}"
+  case "$ARCH" in
+    x64|x86_64|amd64) ARCH=x64 ;;
+    arm64|aarch64) ARCH=arm64 ;;
+    *) die "Unsupported architecture: $ARCH" ;;
+  esac
+
+  if [ "$OS" = linux ]; then
+    vedup_is_wsl && IS_WSL=1
+    if [ -n "${VEDUP_TEST_DISTRO:-}" ]; then
+      DISTRO="$VEDUP_TEST_DISTRO"
+      DISTRO_VERSION="${VEDUP_TEST_DISTRO_VERSION:-test}"
+    else
+      [ -r /etc/os-release ] || die "Cannot identify this Linux distribution."
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      DISTRO="$ID"
+      DISTRO_VERSION="${VERSION_ID:-unknown}"
+    fi
+    case "$DISTRO" in
+      ubuntu) PLATFORM_ADAPTER=ubuntu ;;
+      amzn) PLATFORM_ADAPTER=amazon ;;
+      *) die "Unsupported Linux distribution: $DISTRO" ;;
+    esac
+    if [ "$DISTRO_VERSION" != test ]; then
+      case "$DISTRO/$DISTRO_VERSION" in
+        ubuntu/22.04|ubuntu/24.04|amzn/2023) ;;
+        amzn/2) die "Amazon Linux 2 reached end-of-support on June 30, 2026. Migrate to Amazon Linux 2023 before running Vedup." ;;
+        *) die "Unsupported Linux release: $DISTRO $DISTRO_VERSION" ;;
+      esac
+    fi
+  else
+    DISTRO=macos
+    DISTRO_VERSION="$(sw_vers -productVersion 2>/dev/null || printf 'test')"
+    PLATFORM_ADAPTER=macos
+  fi
+
+  export IS_WSL
+
+  if [ "$PROFILE" = auto ]; then
+    if [ "$OS" = macos ]; then PROFILE=workstation; else PROFILE=server; fi
+  fi
+  case "$PROFILE" in server|workstation) ;; *) die "Unsupported profile: $PROFILE" ;; esac
+  if [ "$APPLY_MACOS_DEFAULTS" = auto ]; then
+    if [ "$OS" = macos ] && [ "$PROFILE" = workstation ]; then APPLY_MACOS_DEFAULTS=1; else APPLY_MACOS_DEFAULTS=0; fi
+  fi
+  if [ "$APPLY_MACOS_DEFAULTS" = 0 ] && { [ "$MINIMAL_DOCK" = 1 ] || [ "$KEYBOARD_SHORTCUTS" = 1 ] || [ "$EXPERIMENTAL_MACOS_DEFAULTS" = 1 ]; }; then
+    die "macOS preference opt-ins cannot be combined with --no-macos-defaults"
+  fi
+}
+
+install_mise() {
+  local platform asset expected url target installed_mise staged previous_dir download_dir
+  platform="$OS"
+  installed_mise="$HOME/.local/bin/mise"
+  if [ -x "$installed_mise" ] && "$installed_mise" --version 2>/dev/null | grep -Eq "(^| )${MISE_VERSION}([ +]|$)"; then
+    export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+    log "Mise $MISE_VERSION is already installed"
+    return 0
+  fi
+  asset="mise-v${MISE_VERSION}-${platform}-${ARCH}"
+  case "$platform/$ARCH" in
+    linux/x64) expected="$MISE_SHA_LINUX_X64" ;;
+    linux/arm64) expected="$MISE_SHA_LINUX_ARM64" ;;
+    macos/x64) expected="$MISE_SHA_MACOS_X64" ;;
+    macos/arm64) expected="$MISE_SHA_MACOS_ARM64" ;;
+    *) die "No Mise checksum for $platform/$ARCH" ;;
+  esac
+  [ -n "$expected" ] || die "No Mise checksum for $platform/$ARCH"
+  url="https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/${asset}"
+  download_dir="$(mktemp -d "${TMPDIR:-/tmp}/vedup-mise.XXXXXX")"
+  target="$download_dir/$asset"
+  download_verified "$url" "$expected" "$target"
+  run chmod +x "$target"
+  run mkdir -p "$HOME/.local/bin"
+  if [ "$DRY_RUN" = 1 ]; then
+    run install -m 0755 "$target" "$HOME/.local/bin/mise"
+  else
+    staged="$HOME/.local/bin/.mise.new.$$"
+    install -m 0755 "$target" "$staged"
+    if [ -x "$installed_mise" ]; then
+      previous_dir="${XDG_DATA_HOME:-$HOME/.local/share}/vedup/previous"
+      mkdir -p "$previous_dir"
+      cp "$installed_mise" "$previous_dir/mise-$("$installed_mise" --version 2>/dev/null | awk '{print $1}' | tr -cd 'A-Za-z0-9._-')"
+    fi
+    mv "$staged" "$installed_mise"
+  fi
+  rm -rf "$download_dir"
+  export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+}
+
+install_mise_tools() {
+  local spec command_name resource mise_bin
+  local -a candidates=() tools=()
+  candidates=(node\|node python\|python aqua:neovim/neovim\|nvim starship\|starship zoxide\|zoxide ripgrep\|rg bat\|bat fzf\|fzf carapace\|carapace jq\|jq yq\|yq lazygit\|lazygit gh\|gh tree-sitter\|tree-sitter)
+  if [ "$OS/$ARCH" != linux/arm64 ]; then candidates+=(tlrc\|tldr); fi
+  if [ "$OS" = linux ]; then
+    candidates+=(fd\|fd delta\|delta btop\|btop)
+  elif [ "$ARCH" = arm64 ]; then
+    candidates+=(fd\|fd delta\|delta)
+  fi
+  [ "$WITH_AWS" = 1 ] && candidates+=(awscli\|aws)
+  [ "$WITH_DOCKER" = 1 ] && candidates+=(lazydocker\|lazydocker)
+  for spec in "${candidates[@]}"; do
+    command_name="${spec##*|}"
+    resource="mise-tool:$command_name"
+    if plan_has_action_for_resource "$resource"; then
+      tools+=("${spec%%|*}")
+    fi
+  done
+  [ "${#tools[@]}" -gt 0 ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] mise trust %q\n' "$REPO_ROOT/mise.toml"
+    printf '[dry-run] MISE_CONFIG_FILE=%q mise install --locked' "$REPO_ROOT/mise.toml"
+    quote_command "${tools[@]}"
+    return 0
+  fi
+  mise_bin="$(mise_binary)" || die "Mise is unavailable after installation."
+  mise_trust_config "$REPO_ROOT/mise.toml"
+  retry_command 3 2 env MISE_CONFIG_FILE="$REPO_ROOT/mise.toml" \
+    "$mise_bin" install --locked "${tools[@]}"
+}
+
+install_eza_linux() {
+  [ "$OS" = linux ] || return 0
+  if inventory_command_exists eza && { [ "$(state_resource_owner cli:eza 2>/dev/null || true)" != vedup-managed ] || eza --version 2>/dev/null | grep -q "v${EZA_VERSION}"; }; then return 0; fi
+  local asset expected build_dir archive
+  case "$ARCH" in
+    x64)
+      asset="eza_x86_64-unknown-linux-musl.tar.gz"
+      expected="$EZA_SHA_LINUX_X64"
+      ;;
+    arm64)
+      asset="eza_aarch64-unknown-linux-gnu.tar.gz"
+      expected="$EZA_SHA_LINUX_ARM64"
+      ;;
+  esac
+  build_dir="$(mktemp -d)"
+  archive="$build_dir/$asset"
+  download_verified "https://github.com/eza-community/eza/releases/download/v${EZA_VERSION}/$asset" \
+    "$expected" "$archive"
+  [ "$DRY_RUN" != 1 ] || return 0
+  tar -xzf "$archive" -C "$build_dir"
+  run mkdir -p "$HOME/.local/bin"
+  run install -m 0755 "$build_dir/eza" "$HOME/.local/bin/eza"
+}
+
+preflight_git_checkout() {
+  local destination="$1"
+  if [ -e "$destination" ] && [ ! -d "$destination/.git" ]; then
+    die "$destination exists but is not a Git checkout. Move it aside and retry."
+  fi
+  if [ -d "$destination/.git" ] && [ -n "$(git -C "$destination" status --porcelain)" ]; then
+    die "$destination has local changes. Commit or discard them before upgrading."
+  fi
+}
+
+sync_git_checkout() {
+  local repository="$1" commit="$2" destination="$3" clone_tmp repository_url stale_tmp previous current backup_id
+  case "$repository" in
+    *://*|/*) repository_url="$repository" ;;
+    *) repository_url="https://github.com/$repository.git" ;;
+  esac
+  if [ -d "$destination/.git" ] && \
+    [ "$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)" = "$commit" ]; then
+    log "${repository##*/} is already pinned"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] sync %s at %s -> %s\n' "$repository_url" "$commit" "$destination"
+    return 0
+  fi
+
+  clone_tmp="${destination}.vedup-tmp-$$-${RANDOM}"
+  for stale_tmp in "${destination}.vedup-tmp-"*; do
+    [ -e "$stale_tmp" ] || continue
+    rm -rf -- "$stale_tmp"
+  done
+  mkdir -p "$(dirname "$destination")"
+  if ! git init --quiet "$clone_tmp" || \
+    ! git -C "$clone_tmp" remote add origin "$repository_url"; then
+    rm -rf -- "$clone_tmp"
+    return 1
+  fi
+  if ! retry_command 3 2 git -C "$clone_tmp" fetch --quiet --depth 1 origin "$commit"; then
+    if ! retry_command 3 2 git -C "$clone_tmp" fetch --quiet origin; then
+      rm -rf -- "$clone_tmp"
+      return 1
+    fi
+  fi
+  if ! git -C "$clone_tmp" checkout --quiet --detach "$commit" || \
+    ! git -C "$clone_tmp" rev-parse --verify "$commit^{commit}" >/dev/null 2>&1; then
+    rm -rf -- "$clone_tmp"
+    return 1
+  fi
+  if [ -d "$destination/.git" ]; then
+    current="$(git -C "$destination" rev-parse --short HEAD 2>/dev/null || printf unknown)"
+    if [ -n "${VEDUP_TRANSACTION_DIR:-}" ]; then
+      backup_id="${RANDOM}-$$"
+      previous="$VEDUP_TRANSACTION_DIR/plugin-backups/$backup_id"
+      mkdir -p "$VEDUP_TRANSACTION_DIR/plugin-backups"
+      printf 'existing\t%s\t%s\n' "$destination" "$previous" >> "$VEDUP_TRANSACTION_DIR/plugin-rollback.tsv"
+    else
+      previous="${destination}.vedup-previous-$current"
+      [ ! -e "$previous" ] || previous="${previous}-$$-${RANDOM}"
+    fi
+    mv -- "$destination" "$previous"
+  elif [ -n "${VEDUP_TRANSACTION_DIR:-}" ]; then
+    printf 'absent\t%s\t\n' "$destination" >> "$VEDUP_TRANSACTION_DIR/plugin-rollback.tsv"
+  fi
+  if ! mv -- "$clone_tmp" "$destination"; then
+    [ ! -d "${previous:-}" ] || mv -- "$previous" "$destination"
+    rm -rf -- "$clone_tmp"
+    return 1
+  fi
+}
+
+plugins_rollback() {
+  local transaction="${1:-${VEDUP_TRANSACTION_DIR:-}}" manifest kind destination previous
+  [ -n "$transaction" ] || return 0
+  [ ! -f "$transaction/COMMITTED" ] || return 0
+  manifest="$transaction/plugin-rollback.tsv"
+  [ -s "$manifest" ] || return 0
+  grep -Fqx 'rolled-back' "$manifest" 2>/dev/null && return 0
+  while IFS=$'\t' read -r kind destination previous; do
+    case "$kind" in
+      existing)
+        [ -e "$previous" ] || continue
+        rm -rf -- "$destination"
+        mv -- "$previous" "$destination"
+        ;;
+      absent) rm -rf -- "$destination" ;;
+    esac
+  done < "$manifest"
+  printf 'rolled-back\n' >> "$manifest"
+  state_journal plugins rolled-back "Previous plugin checkouts restored"
+}
+
+plugins_commit() {
+  local manifest="${VEDUP_TRANSACTION_DIR:-}/plugin-rollback.tsv"
+  [ -s "$manifest" ] || return 0
+  printf 'committed\n' >> "$manifest"
+}
+
+sync_plugin_checkouts() {
+  local max_jobs="$1" spec repository_and_commit repository commit destination
+  local start=0 batch_count index failed pid
+  local -a specs=() pids=() names=()
+  shift
+  specs=("$@")
+
+  for spec in "${specs[@]}"; do
+    destination="${spec##*|}"
+    preflight_git_checkout "$destination"
+  done
+
+  if [ "$DRY_RUN" = 1 ] || [ "$max_jobs" -le 1 ]; then
+    for spec in "${specs[@]}"; do
+      repository_and_commit="${spec%%|*}"
+      destination="${spec##*|}"
+      repository="${repository_and_commit%%:*}"
+      commit="${repository_and_commit#*:}"
+      sync_git_checkout "$repository" "$commit" "$destination"
+    done
+    return 0
+  fi
+
+  while [ "$start" -lt "${#specs[@]}" ]; do
+    pids=()
+    names=()
+    batch_count=0
+    while [ "$batch_count" -lt "$max_jobs" ] && [ "$start" -lt "${#specs[@]}" ]; do
+      spec="${specs[$start]}"
+      repository_and_commit="${spec%%|*}"
+      destination="${spec##*|}"
+      repository="${repository_and_commit%%:*}"
+      commit="${repository_and_commit#*:}"
+      (
+        trap - ERR EXIT INT TERM
+        set -Eeuo pipefail
+        sync_git_checkout "$repository" "$commit" "$destination"
+      ) &
+      pids+=("$!")
+      names+=("${repository##*/}")
+      start=$((start + 1))
+      batch_count=$((batch_count + 1))
+    done
+
+    failed=0
+    index=0
+    for pid in "${pids[@]}"; do
+      if ! wait "$pid"; then
+        warn "Plugin checkout failed: ${names[$index]}"
+        failed=1
+      fi
+      index=$((index + 1))
+    done
+    [ "$failed" -eq 0 ] || return 1
+  done
+}
+
+install_tlrc_linux_arm64() {
+  [ "$OS/$ARCH" = linux/arm64 ] || return 0
+  if inventory_command_exists tldr && { [ "$(state_resource_owner cli:tldr 2>/dev/null || true)" != vedup-managed ] || tldr --version 2>/dev/null | grep -q "$TLRC_VERSION"; }; then return 0; fi
+  local build_dir archive
+  build_dir="$(mktemp -d)"
+  archive="$build_dir/tlrc.tar.gz"
+  download_verified \
+    "https://github.com/tldr-pages/tlrc/releases/download/v${TLRC_VERSION}/tlrc-v${TLRC_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+    "$TLRC_SHA_LINUX_ARM64" "$archive"
+  run tar -xzf "$archive" -C "$build_dir" tldr
+  run mkdir -p "$HOME/.local/bin"
+  run install -m 0755 "$build_dir/tldr" "$HOME/.local/bin/tldr"
+}
+
+install_terminal_plugins() {
+  local zsh_root tmux_root plugin_jobs spec repository_and_commit destination plugin_name
+  local -a candidates=() selected=()
+  zsh_root="${XDG_DATA_HOME:-$HOME/.local/share}/vedup/zsh/plugins"
+  tmux_root="$HOME/.tmux/plugins"
+  plugin_jobs="${PLUGIN_SYNC_JOBS:-$PARALLEL_JOBS}"
+  candidates=(
+    "zsh-autosuggestions|zsh-users/zsh-autosuggestions:$ZSH_AUTOSUGGESTIONS_COMMIT|$zsh_root/zsh-autosuggestions"
+    "zsh-syntax-highlighting|zsh-users/zsh-syntax-highlighting:$ZSH_SYNTAX_HIGHLIGHTING_COMMIT|$zsh_root/zsh-syntax-highlighting"
+    "zsh-history-substring-search|zsh-users/zsh-history-substring-search:$ZSH_HISTORY_SUBSTRING_SEARCH_COMMIT|$zsh_root/zsh-history-substring-search"
+    "zsh-completions|zsh-users/zsh-completions:$ZSH_COMPLETIONS_COMMIT|$zsh_root/zsh-completions"
+    "zsh-you-should-use|MichaelAquilina/zsh-you-should-use:$ZSH_YOU_SHOULD_USE_COMMIT|$zsh_root/zsh-you-should-use"
+    "git-alias|chivalryq/git-alias:$ZSH_GIT_ALIAS_COMMIT|$zsh_root/git-alias"
+    "tpm|tmux-plugins/tpm:$TPM_COMMIT|$tmux_root/tpm"
+    "vim-tmux-navigator|christoomey/vim-tmux-navigator:$TMUX_NAVIGATOR_COMMIT|$tmux_root/vim-tmux-navigator"
+    "tmux-resurrect|tmux-plugins/tmux-resurrect:$TMUX_RESURRECT_COMMIT|$tmux_root/tmux-resurrect"
+    "tmux-continuum|tmux-plugins/tmux-continuum:$TMUX_CONTINUUM_COMMIT|$tmux_root/tmux-continuum"
+    "tmux-sensible|tmux-plugins/tmux-sensible:$TMUX_SENSIBLE_COMMIT|$tmux_root/tmux-sensible"
+    "tmux-online-status|tmux-plugins/tmux-online-status:$TMUX_ONLINE_STATUS_COMMIT|$tmux_root/tmux-online-status"
+    "tmux-battery|tmux-plugins/tmux-battery:$TMUX_BATTERY_COMMIT|$tmux_root/tmux-battery"
+    "tmux-catppuccin|catppuccin/tmux:$TMUX_CATPPUCCIN_COMMIT|$tmux_root/tmux"
+  )
+  for spec in "${candidates[@]}"; do
+    plugin_name="${spec%%|*}"
+    repository_and_commit="${spec#*|}"
+    destination="${repository_and_commit##*|}"
+    if { [ ! -e "$destination" ] && [ ! -L "$destination" ]; } || \
+      { [ -d "$destination/.git" ] && [ "$(state_resource_owner "plugin:$plugin_name" 2>/dev/null || true)" = vedup-managed ]; }; then
+      selected+=("$repository_and_commit")
+    fi
+  done
+  [ "${#selected[@]}" -gt 0 ] || return 0
+  sync_plugin_checkouts "$plugin_jobs" "${selected[@]}"
+}
+
+install_platform_cli_artifacts() {
+  install_eza_linux
+  install_tlrc_linux_arm64
+}
+
+install_development_components() {
+  local plugin_jobs
+  local -a tasks=()
+  tasks=(
+    "Pinned development tools|install_mise_tools"
+    "Platform CLI artifacts|install_platform_cli_artifacts"
+  )
+  if [ "$SKIP_PLUGINS" != 1 ]; then
+    plugin_jobs=$((PARALLEL_JOBS - 2))
+    [ "$plugin_jobs" -ge 1 ] || plugin_jobs=1
+    PLUGIN_SYNC_JOBS="$plugin_jobs"
+    tasks+=("Pinned terminal plugins|install_terminal_plugins")
+  fi
+  run_parallel_tasks "$PARALLEL_JOBS" "${tasks[@]}"
+}
+
+install_cursor_extensions() {
+  has cursor || { warn "Cursor is not on PATH; extension installation will be retried by the next setup run."; return 0; }
+  while IFS= read -r extension; do
+    [ -n "$extension" ] && run cursor --install-extension "$extension" --force
+  done < "$REPO_ROOT/profiles/macos/cursor-extensions.txt"
+}
+
+warm_zsh_startup_cache() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] refresh Vedup Zsh startup cache\n'
+    return 0
+  fi
+  # shellcheck disable=SC2016
+  env VEDUP_ZSH_REFRESH_CACHE=1 VEDUP_APPLIED_RELEASE="$REPO_ROOT" \
+    TERM="${TERM:-xterm-256color}" \
+    zsh -dfic 'source "$1"' _ "$HOME/.zshrc" </dev/null >/dev/null
+}
+
+install_neovim_plugins() {
+  local expected_version actual_version
+  expected_version="$(plan_mise_version aqua:neovim/neovim)"
+  [ -n "$expected_version" ] || die "The release does not declare a Neovim version."
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] MISE_CONFIG_FILE=%q mise exec -- nvim --headless +Lazy!\ restore +qa </dev/null\n' \
+      "$REPO_ROOT/mise.toml"
+    return 0
+  fi
+  mise_trust_config "$REPO_ROOT/mise.toml" || die "Could not trust the release Mise configuration."
+  actual_version="$(mise_exec_config "$REPO_ROOT/mise.toml" nvim --version 2>/dev/null | \
+    awk 'NR == 1 { version=$2; sub(/^v/, "", version); print version; exit }')"
+  [ "$actual_version" = "$expected_version" ] || \
+    die "Pinned Neovim $expected_version could not be selected (resolved ${actual_version:-unknown})."
+  retry_command 3 2 mise_exec_config "$REPO_ROOT/mise.toml" \
+    nvim --headless '+Lazy! restore' +qa </dev/null || \
+    die "Neovim plugin synchronization failed with pinned Neovim $expected_version."
+}
+
+change_login_shell() {
+  [ "$CHANGE_SHELL" = 1 ] || return 0
+  local zsh_path
+  zsh_path="$(command -v zsh || true)"
+  [ -n "$zsh_path" ] || die "Zsh is not installed."
+  [ "${SHELL:-}" = "$zsh_path" ] && return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] chsh -s %q %q\n' "$zsh_path" "$USER"
+  else
+    sudo_run chsh -s "$zsh_path" "$USER" || warn "Could not change the login shell; run: chsh -s $zsh_path"
+  fi
+}
+
+install_vedup_command() {
+  local target="$HOME/.local/bin/vedup" previous backup
+  mkdir -p "$HOME/.local/bin"
+  VEDUP_COMMAND_ROLLBACK_FILE="$VEDUP_TRANSACTION_DIR/vedup-command.previous"
+  if [ -L "$target" ]; then
+    previous="$(readlink "$target")"
+    printf 'link\t%s\n' "$previous" > "$VEDUP_COMMAND_ROLLBACK_FILE"
+  elif [ -f "$target" ] && vedup_launcher_is_managed "$target"; then
+    backup="$VEDUP_TRANSACTION_DIR/vedup-command.file"
+    cp "$target" "$backup"
+    printf 'file\t%s\n' "$backup" > "$VEDUP_COMMAND_ROLLBACK_FILE"
+  elif [ -e "$target" ]; then
+    die "The existing $target is not managed by Vedup. Move it aside and rerun."
+  else
+    printf 'absent\t\n' > "$VEDUP_COMMAND_ROLLBACK_FILE"
+  fi
+  vedup_install_launcher "$target"
+}
+
+vedup_command_rollback() {
+  local target="$HOME/.local/bin/vedup" kind previous
+  [ -r "${VEDUP_COMMAND_ROLLBACK_FILE:-}" ] || return 0
+  IFS=$'\t' read -r kind previous < "$VEDUP_COMMAND_ROLLBACK_FILE"
+  case "$kind" in
+    link) ln -sfn "$previous" "$target" ;;
+    file) cp "$previous" "$target"; chmod 0755 "$target" ;;
+    absent) rm -f "$target" ;;
+  esac
+  VEDUP_COMMAND_ROLLBACK_FILE=""
+}
+
+vedup_command_commit() { VEDUP_COMMAND_ROLLBACK_FILE=""; }
+
+invoke_macos_settings() {
+  if [ "$DRY_RUN" = 1 ]; then
+    if [ "$(uname -s)" = Darwin ]; then
+      "$REPO_ROOT/dotfiles/macos/setup-commands.sh" --dry-run "$@"
+    else
+      VEDUP_TEST_OS=macos VEDUP_TEST_MACOS_MAJOR=26 \
+        "$REPO_ROOT/dotfiles/macos/setup-commands.sh" --dry-run "$@"
+    fi
+  else
+    "$REPO_ROOT/dotfiles/macos/setup-commands.sh" "$@"
+  fi
+}
+
+atomic_replace_link() {
+  local target="$1" destination="$2" temporary
+  temporary="${target}.new.$$"
+  mkdir -p "$(dirname "$target")"
+  ln -s "$destination" "$temporary"
+  if mv -Tf "$temporary" "$target" 2>/dev/null; then :
+  elif mv -fh "$temporary" "$target" 2>/dev/null; then :
+  else rm -f "$temporary"; return 1; fi
+}
+
+release_pointers_activate() {
+  local pending="${VEDUP_PENDING_RELEASE:-}" pointer kind previous
+  [ -n "$pending" ] && [ -n "${VEDUP_CURRENT_LINK:-}" ] || return 0
+  [ "$pending" = "$REPO_ROOT" ] || { warn "Pending release path does not match the running release."; return 1; }
+  if [ ! -x "$pending/bin/vedup" ] || [ ! -x "$pending/bin/setup" ] || [ ! -x "$pending/bin/doctor" ]; then
+    warn "Pending release is incomplete."
+    return 1
+  fi
+  VEDUP_RELEASE_ROLLBACK_FILE="$VEDUP_TRANSACTION_DIR/release-pointers.tsv"
+  : > "$VEDUP_RELEASE_ROLLBACK_FILE"
+  for pointer in "$VEDUP_CURRENT_LINK" "$VEDUP_APPLIED_LINK"; do
+    if [ -L "$pointer" ]; then kind="link"; previous="$(readlink "$pointer")"
+    elif [ -e "$pointer" ]; then warn "Release pointer is not a symlink: $pointer"; release_pointers_rollback; return 1
+    else kind=absent; previous=""; fi
+    printf 'previous\t%s\t%s\t%s\n' "$pointer" "$kind" "$previous" >> "$VEDUP_RELEASE_ROLLBACK_FILE"
+    if ! atomic_replace_link "$pointer" "$pending"; then
+      release_pointers_rollback
+      return 1
+    fi
+    printf 'activated\t%s\n' "$pointer" >> "$VEDUP_RELEASE_ROLLBACK_FILE"
+  done
+  state_journal release activated "CLI and applied release pointers activated transactionally"
+}
+
+release_pointers_rollback() {
+  local transaction="${1:-${VEDUP_TRANSACTION_DIR:-}}" file record pointer kind previous
+  [ -n "$transaction" ] || return 0
+  [ ! -f "$transaction/COMMITTED" ] || return 0
+  file="$transaction/release-pointers.tsv"
+  [ -s "$file" ] || return 0
+  grep -Eq '^(committed|rolled-back)$' "$file" 2>/dev/null && return 0
+  while IFS=$'\t' read -r record pointer kind previous; do
+    [ "$record" = previous ] || continue
+    case "$kind" in
+      link) atomic_replace_link "$pointer" "$previous" || return 1 ;;
+      absent) rm -f "$pointer" ;;
+    esac
+  done < "$file"
+  printf 'rolled-back\n' >> "$file"
+  state_journal release rolled-back "Previous CLI and applied release pointers restored"
+}
+
+release_pointers_commit() {
+  [ -n "${VEDUP_RELEASE_ROLLBACK_FILE:-}" ] && [ -f "$VEDUP_RELEASE_ROLLBACK_FILE" ] && printf 'committed\n' >> "$VEDUP_RELEASE_ROLLBACK_FILE"
+  return 0
+}
+
+activate_pending_release() {
+  # Compatibility helper used by the no-op path. A no-op synchronization still
+  # needs a transaction so CLI and applied pointers cannot diverge on failure.
+  release_pointers_activate
+}
+
+run_planned_stage() {
+  local name="$1" description="$2" function_name="$3"
+  progress_begin "$name" "$description"
+  "$function_name"
+  progress_done
+}
+
+run_scoped_operation() {
+  local previous_release_ref="${VEDUP_RELEASE_REF:-}" previous_release_commit="${VEDUP_RELEASE_COMMIT:-}" macos_settings_args
+  [ "$OS" = macos ] || die "The selected maintenance operation is available only on macOS."
+  setup_lock_acquire
+  case "$OPERATION_SCOPE" in
+    apps)
+      progress_init
+      PROGRESS_TOTAL=1
+      progress_header "$OS/$DISTRO $DISTRO_VERSION on $ARCH" "application updates"
+      progress_begin "Updating selected applications" "Upgrade only the GUI applications explicitly selected in the review."
+      brew_upgrade_selected_apps
+      progress_done
+      ;;
+    macos-preferences)
+      if [ "$DRY_RUN" != 1 ]; then
+        state_validate_resources "$VEDUP_LIVE_RESOURCES_FILE" || die "Managed resource state is invalid; run a normal Vedup sync before changing advanced settings."
+        state_begin_transaction
+        VEDUP_RELEASE_REF="${STATE_RELEASE:-development}"
+        VEDUP_RELEASE_COMMIT="${STATE_COMMIT:-unknown}"
+        state_write_candidate complete
+        cp "$VEDUP_LIVE_RESOURCES_FILE" "$VEDUP_TRANSACTION_DIR/candidate-resources.tsv"
+      fi
+      progress_init
+      PROGRESS_TOTAL=2
+      progress_header "$OS/$DISTRO $DISTRO_VERSION on $ARCH" "macOS preferences"
+      progress_begin "Applying selected macOS preferences" "Snapshot touched values and apply only the reviewed preference changes."
+      VEDUP_MACOS_ROLLBACK_FILE="$VEDUP_TRANSACTION_DIR/macos-rollback"
+      export VEDUP_MACOS_ROLLBACK_FILE
+      macos_settings_args=(--advanced-only)
+      [ "$MINIMAL_DOCK" = 1 ] && macos_settings_args+=(--minimal-dock)
+      [ "$KEYBOARD_SHORTCUTS" = 1 ] && macos_settings_args+=(--keyboard-shortcuts)
+      [ "$EXPERIMENTAL_MACOS_DEFAULTS" = 1 ] && macos_settings_args+=(--experimental)
+      if [ "${#macos_settings_args[@]}" -gt 1 ]; then invoke_macos_settings "${macos_settings_args[@]}"; fi
+      progress_done
+      progress_begin "Verifying preferences" "Confirm the selected preference values before saving the choices."
+      if [ "${#macos_settings_args[@]}" -gt 1 ]; then invoke_macos_settings --check "${macos_settings_args[@]}"; fi
+      if [ "$DRY_RUN" != 1 ]; then
+        state_commit_candidate
+        state_complete_transaction
+        rm -f "$VEDUP_MACOS_ROLLBACK_FILE"
+      fi
+      progress_done
+      VEDUP_RELEASE_REF="$previous_release_ref"
+      VEDUP_RELEASE_COMMIT="$previous_release_commit"
+      ;;
+  esac
+  trap - ERR
+  SETUP_SUCCESS=1
+  progress_finish
+  plan_cleanup
+  setup_lock_release
+}
+
+recover_interrupted_transaction() {
+  local transaction="${VEDUP_INTERRUPTED_TRANSACTION_DIR:-}" macos_backup_path
+  [ -n "$transaction" ] && [ -d "$transaction" ] || return 0
+  VEDUP_TRANSACTION_DIR="$transaction"
+  if [ -f "$transaction/COMMITTED" ]; then
+    [ ! -f "$transaction/config-activation.tsv" ] || grep -Eq '^committed$' "$transaction/config-activation.tsv" || printf 'committed\n' >> "$transaction/config-activation.tsv"
+    [ ! -f "$transaction/release-pointers.tsv" ] || grep -Eq '^committed$' "$transaction/release-pointers.tsv" || printf 'committed\n' >> "$transaction/release-pointers.tsv"
+    rm -f "$transaction/macos-rollback"
+    rm -rf "$transaction/plugin-backups"
+    state_journal transaction complete "Finished cleanup for the previously committed synchronization"
+    return 0
+  fi
+
+  warn "Recovering the previous interrupted synchronization before continuing."
+  DOTFILES_ROOT="$(config_dotfiles_root)"
+  DOTFILES_ROLLBACK_MANIFEST="$transaction/dotfiles-rollback.tsv"
+  if [ -s "$DOTFILES_ROLLBACK_MANIFEST" ]; then DOTFILES_ROLLBACK_ARMED=1; dotfiles_rollback; fi
+  config_rollback_workspace "$transaction"
+  plugins_rollback "$transaction"
+  VEDUP_COMMAND_ROLLBACK_FILE="$transaction/vedup-command.previous"
+  [ ! -r "$VEDUP_COMMAND_ROLLBACK_FILE" ] || vedup_command_rollback
+  release_pointers_rollback "$transaction"
+  if [ -f "$transaction/state-commit.armed" ]; then state_rollback_commit "$transaction"; fi
+  if [ -r "$transaction/macos-rollback" ]; then
+    macos_backup_path="$(sed -n '1p' "$transaction/macos-rollback")"
+    case "$macos_backup_path" in
+      "$VEDUP_STATE_DIR"/macos-preferences/*) "$REPO_ROOT/bin/macos-restore" "$macos_backup_path" || true ;;
+    esac
+    rm -f "$transaction/macos-rollback"
+  fi
+  state_journal transaction rolled-back "Recovered reversible state from an interrupted synchronization"
+}
+
+main() {
+  local needs_release_activation=0
+  state_detect_workflow
+  if [ "$STATE_FOUND" = 1 ]; then
+    [ "$PROFILE_EXPLICIT" = 1 ] || PROFILE="$STATE_PROFILE"
+    [ "$AWS_EXPLICIT" = 1 ] || WITH_AWS="$STATE_WITH_AWS"
+    [ "$DOCKER_EXPLICIT" = 1 ] || WITH_DOCKER="$STATE_WITH_DOCKER"
+    [ "$PERSONAL_APPS_EXPLICIT" = 1 ] || WITH_PERSONAL_APPS="$STATE_WITH_PERSONAL_APPS"
+    [ "$MACOS_DEFAULTS_EXPLICIT" = 1 ] || APPLY_MACOS_DEFAULTS="$STATE_APPLY_MACOS_DEFAULTS"
+    [ "$MINIMAL_DOCK_EXPLICIT" = 1 ] || MINIMAL_DOCK="$STATE_MINIMAL_DOCK"
+    [ "$KEYBOARD_SHORTCUTS_EXPLICIT" = 1 ] || KEYBOARD_SHORTCUTS="$STATE_KEYBOARD_SHORTCUTS"
+    [ "$EXPERIMENTAL_DEFAULTS_EXPLICIT" = 1 ] || EXPERIMENTAL_MACOS_DEFAULTS="$STATE_EXPERIMENTAL_MACOS_DEFAULTS"
+    [ "$SHELL_EXPLICIT" = 1 ] || CHANGE_SHELL="$STATE_CHANGE_SHELL"
+  fi
+  detect_platform
+  choices_load_or_default || die "Saved application choices are invalid."
+  choices_apply_environment || die "Saved application choices are invalid."
+  if [ "$PROFILE_EXPLICIT" = 1 ] && [ -z "${VEDUP_WORKSTATION_BUNDLE:-}" ]; then
+    [ "$PROFILE" = workstation ] && CHOICES_WORKSTATION_BUNDLE=1 || CHOICES_WORKSTATION_BUNDLE=0
+  fi
+  if [ "$PERSONAL_APPS_EXPLICIT" = 1 ] && [ -z "${VEDUP_OPTIONAL_BUNDLE:-}" ]; then
+    CHOICES_OPTIONAL_BUNDLE="$WITH_PERSONAL_APPS"
+  fi
+  WITH_PERSONAL_APPS="$CHOICES_OPTIONAL_BUNDLE"
+  choices_export
+  # shellcheck disable=SC1090
+  . "$REPO_ROOT/lib/platforms/$PLATFORM_ADAPTER.sh"
+
+  export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+  export MISE_CONFIG_FILE="$REPO_ROOT/mise.toml"
+  STOW_PACKAGES=(zsh nvim starship tmux scripts)
+  if [ "$OS" = macos ]; then
+    choices_app_selected workstation cask nikitabobko/tap/aerospace && STOW_PACKAGES+=(aerospace)
+    choices_app_selected workstation cask ghostty && STOW_PACKAGES+=(ghostty)
+    choices_app_selected workstation cask cursor && STOW_PACKAGES+=(cursor)
+  fi
+  DOTFILES_ROOT="$VEDUP_CONFIG_WORKTREE"
+  export DOTFILES_ROOT
+
+  plan_generate
+  PLAN_CHANGE_COUNT=$((PLAN_INSTALL_COUNT + PLAN_UPDATE_COUNT + PLAN_CONFIGURE_COUNT + PLAN_CONFLICT_COUNT))
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '\nVedup safe-sync plan\n'
+    plan_print details
+  fi
+  if [ "$OPERATION_SCOPE" != full ]; then
+    run_scoped_operation
+    return 0
+  fi
+  if [ "$DRY_RUN" != 1 ] && awk -F '\t' '$1 == "review" && $4 == "unmanaged-conflict" { found=1 } END { exit !found }' "$PLAN_FILE"; then
+    plan_print details >&2
+    die "The plan contains an unmanaged path conflict. Nothing was changed; resolve the reviewed path and rerun Vedup."
+  fi
+
+  RUN_FOUNDATIONS=0 RUN_MISE=0 RUN_DEVELOPMENT=0 RUN_WORKSTATION=0
+  RUN_OPTIONAL=0 RUN_DOTFILES=0 RUN_INTEGRATIONS=0 RUN_MACOS_SETTINGS=0 RUN_SHELL=0
+  if [ "$DOTFILES_ONLY" != 1 ]; then
+    plan_has_action_for_provider "$PLATFORM_ADAPTER" && RUN_FOUNDATIONS=1
+    plan_has_action_for_provider homebrew && RUN_FOUNDATIONS=1
+    plan_has_action_for_provider system && RUN_FOUNDATIONS=1
+    plan_has_action_for_resource mise && RUN_MISE=1
+    { plan_has_action_for_prefix mise-tool: || plan_has_action_for_prefix cli: || plan_has_action_for_prefix plugin:; } && RUN_DEVELOPMENT=1
+    if [ "$OS" = macos ] && apps_scope_has_planned_action workstation; then
+      RUN_WORKSTATION=1
+    fi
+    if [ "$WITH_DOCKER" = 1 ] && plan_has_action_for_resource docker; then RUN_OPTIONAL=1; fi
+    if [ "$OS" = macos ] && apps_scope_has_planned_action optional; then
+      RUN_OPTIONAL=1
+    fi
+  fi
+  plan_has_action_for_resource dotfiles && RUN_DOTFILES=1
+  [ "$PLAN_CONFLICT_COUNT" -gt 0 ] && RUN_DOTFILES=1
+  if [ "$DOTFILES_ONLY" != 1 ] && { [ "$RUN_DOTFILES" = 1 ] || [ "$RUN_DEVELOPMENT" = 1 ] || [ "$RUN_WORKSTATION" = 1 ]; }; then RUN_INTEGRATIONS=1; fi
+  plan_has_action_for_resource macos-preferences && RUN_MACOS_SETTINGS=1
+  plan_has_action_for_resource login-shell && RUN_SHELL=1
+
+  PROGRESS_TOTAL=$((RUN_FOUNDATIONS + RUN_MISE + RUN_DEVELOPMENT + RUN_WORKSTATION + RUN_OPTIONAL + RUN_DOTFILES + RUN_INTEGRATIONS + RUN_MACOS_SETTINGS + RUN_SHELL))
+  [ "$DRY_RUN" = 1 ] || PROGRESS_TOTAL=$((PROGRESS_TOTAL + 1))
+
+  if [ -n "${VEDUP_PENDING_RELEASE:-}" ] && [ -n "${VEDUP_CURRENT_LINK:-}" ]; then
+    if [ ! -L "$VEDUP_CURRENT_LINK" ] || [ "$(readlink "$VEDUP_CURRENT_LINK" 2>/dev/null || true)" != "$VEDUP_PENDING_RELEASE" ] || \
+      [ ! -L "$VEDUP_APPLIED_LINK" ] || [ "$(readlink "$VEDUP_APPLIED_LINK" 2>/dev/null || true)" != "$VEDUP_PENDING_RELEASE" ]; then
+      needs_release_activation=1
+    fi
+  fi
+  if [ "$PLAN_CHANGE_COUNT" -eq 0 ] && [ "$DRY_RUN" != 1 ] && \
+    [ "$STATE_WORKFLOW" != interrupted ] && [ "$needs_release_activation" = 0 ]; then
+    if [ "$DOTFILES_ONLY" = 1 ]; then "$REPO_ROOT/bin/doctor" --quick --dotfiles-only
+    else "$REPO_ROOT/bin/doctor" --quick; fi
+    printf 'Vedup: this machine is already synchronized; no changes were made.\n'
+    plan_cleanup
+    return 0
+  fi
+
+  setup_lock_acquire
+  if [ "$DRY_RUN" != 1 ]; then
+    [ "$STATE_WORKFLOW" != interrupted ] || recover_interrupted_transaction
+    state_begin_transaction
+    state_write_candidate pending
+  fi
+  if [ "$DRY_RUN" != 1 ] && [ "$PLAN_NEEDS_SUDO" = 1 ]; then
+    sudo_acquire
+  fi
+  progress_init
+  trap 'progress_failed "$?" "$LINENO"' ERR
+  progress_header "$OS/$DISTRO $DISTRO_VERSION on $ARCH" "$PROFILE"
+
+  if [ "$RUN_FOUNDATIONS" = 1 ]; then
+    progress_begin "Installing missing foundations" "Inspect the platform and install only absent system or Homebrew packages."
+    platform_prepare
+    platform_install_foundations
+    progress_done
+  fi
+
+  if [ "$RUN_MISE" = 1 ]; then
+    progress_begin "Synchronizing Mise" "Atomically install the release-pinned tool manager under ~/.local/bin."
+    install_mise
+    progress_done
+  fi
+
+  if [ "$RUN_DEVELOPMENT" = 1 ]; then
+    progress_begin "Synchronizing development tools" "Converge managed tools and plugins with bounded concurrency and retained prior checkouts."
+    install_development_components
+    progress_done
+  fi
+
+  if [ "$RUN_WORKSTATION" = 1 ]; then
+    progress_begin "Installing missing workstation apps" "Use the Vedup app manifest, Homebrew, and the App Store in missing-only mode."
+    platform_install_workstation
+    progress_done
+  fi
+  if [ "$RUN_OPTIONAL" = 1 ]; then
+    progress_begin "Synchronizing selected components" "Install only missing optional capabilities; never run a general upgrade."
+    if [ "$WITH_DOCKER" = 1 ] && [ "$OS" = linux ]; then platform_install_docker; fi
+    if [ "$OS" = macos ] && apps_scope_has_planned_action optional; then platform_install_personal_apps; fi
+    progress_done
+  fi
+
+  if [ "$RUN_DOTFILES" = 1 ]; then
+    progress_begin "Synchronizing configuration" "Preflight Stow, journal backups, and restore automatically if verification fails."
+    if ! has stow && [ "$DRY_RUN" != 1 ]; then die "GNU Stow is required to link dotfiles."; fi
+    if [ "$DRY_RUN" != 1 ]; then
+      config_prepare_workspace || die "Configuration changed locally and in this release; run 'vedup status' to review conflicts."
+      config_activate_workspace || die "Could not activate the writable configuration workspace."
+    else
+      DOTFILES_ROOT="$(config_dotfiles_root)"
+    fi
+    setup_dotfiles
+    progress_done
+  fi
+
+  if [ "$RUN_INTEGRATIONS" = 1 ]; then
+    progress_begin "Preparing terminal and editor integrations" "Prebuild the Zsh startup cache, then synchronize Cursor extensions when available."
+    warm_zsh_startup_cache
+    install_neovim_plugins
+    if [ "$OS" = macos ]; then install_cursor_extensions; fi
+    progress_done
+  fi
+  if [ "$RUN_MACOS_SETTINGS" = 1 ]; then
+    progress_begin "Applying macOS preferences" "Create a restorable snapshot, then apply the selected safe and opt-in settings."
+    macos_settings_args=()
+    VEDUP_MACOS_ROLLBACK_FILE="$VEDUP_TRANSACTION_DIR/macos-rollback"
+    export VEDUP_MACOS_ROLLBACK_FILE
+    [ "$MINIMAL_DOCK" = 1 ] && macos_settings_args+=(--minimal-dock)
+    [ "$KEYBOARD_SHORTCUTS" = 1 ] && macos_settings_args+=(--keyboard-shortcuts)
+    [ "$EXPERIMENTAL_MACOS_DEFAULTS" = 1 ] && macos_settings_args+=(--experimental)
+    if [ "${#macos_settings_args[@]}" -eq 0 ]; then
+      invoke_macos_settings
+    else
+      invoke_macos_settings "${macos_settings_args[@]}"
+    fi
+    progress_done
+  fi
+
+  if [ "$RUN_SHELL" = 1 ]; then
+    progress_begin "Finalizing the login shell" "Make Zsh the default for new terminal sessions."
+    change_login_shell
+    progress_done
+  fi
+
+  if [ "$DRY_RUN" != 1 ]; then
+    progress_begin "Verifying and committing" "Run health checks, commit state, then atomically activate this release."
+    install_vedup_command
+    state_write_candidate complete
+    if [ "$VERIFY" = 1 ]; then
+      VEDUP_STATE_CANDIDATE="$VEDUP_TRANSACTION_DIR/candidate-state.tsv" \
+        VEDUP_RESOURCES_CANDIDATE="$VEDUP_TRANSACTION_DIR/candidate-resources.tsv" \
+        VEDUP_CHOICES_CANDIDATE="$VEDUP_TRANSACTION_DIR/candidate-choices.tsv" "$REPO_ROOT/bin/doctor"
+    else
+      doctor_args=(--quick)
+      [ "$DOTFILES_ONLY" = 1 ] && doctor_args+=(--dotfiles-only)
+      VEDUP_STATE_CANDIDATE="$VEDUP_TRANSACTION_DIR/candidate-state.tsv" \
+        VEDUP_RESOURCES_CANDIDATE="$VEDUP_TRANSACTION_DIR/candidate-resources.tsv" \
+        VEDUP_CHOICES_CANDIDATE="$VEDUP_TRANSACTION_DIR/candidate-choices.tsv" "$REPO_ROOT/bin/doctor" "${doctor_args[@]}"
+    fi
+    if ! release_pointers_activate; then
+      die "The pending release could not be activated; previous state and configuration are being restored."
+    fi
+    state_commit_candidate
+    if [ -n "${VEDUP_PENDING_RELEASE:-}" ] && [ -n "${VEDUP_CURRENT_LINK:-}" ]; then
+      "$HOME/.local/bin/vedup" help >/dev/null
+    fi
+    state_complete_transaction
+    dotfiles_commit
+    config_commit_workspace
+    plugins_commit
+    rm -rf "$VEDUP_TRANSACTION_DIR/plugin-backups"
+    vedup_command_commit
+    release_pointers_commit
+    if [ -n "${VEDUP_MACOS_ROLLBACK_FILE:-}" ]; then rm -f "$VEDUP_MACOS_ROLLBACK_FILE"; fi
+    progress_done
+  fi
+  trap - ERR
+  SETUP_SUCCESS=1
+  progress_finish
+  plan_cleanup
+  sudo_release
+  setup_lock_release
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main
+fi

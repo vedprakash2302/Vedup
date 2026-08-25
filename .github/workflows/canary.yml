@@ -1,0 +1,73 @@
+name: Disposable machine canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or release candidate to exercise
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  safe-sync-twice:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Remove unrelated stale Homebrew tap
+        if: runner.os == 'macOS'
+        run: brew untap aws/tap 2>/dev/null || true
+      - name: Run terminal-profile canary
+        run: ./bin/setup --non-interactive --profile server --no-macos-defaults --no-shell-change
+      - name: Assert the second synchronization is a no-op
+        run: |
+          output="$(./bin/setup --non-interactive --profile server --no-macos-defaults --no-shell-change)"
+          grep -q 'already synchronized; no changes were made' <<< "$output"
+
+  amazon-linux-safe-sync-twice:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["amazonlinux:2023"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Run an additive synchronization twice in a disposable container
+        env:
+          CANARY_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            --env HOME=/root \
+            --env USER=root \
+            --volume "$PWD:/vedup:ro" \
+            "$CANARY_IMAGE" /bin/bash -lc '
+              /vedup/bin/setup --non-interactive --profile server --no-macos-defaults --no-shell-change
+              output="$(/vedup/bin/setup --non-interactive --profile server --no-macos-defaults --no-shell-change)"
+              grep -q "already synchronized; no changes were made" <<< "$output"
+            '
+
+  amazon-linux-2-rejection:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Reject the end-of-support Amazon Linux release clearly
+        run: |
+          output="$(docker run --rm \
+            --env HOME=/root \
+            --env USER=root \
+            --volume "$PWD:/vedup:ro" \
+            amazonlinux:2 /bin/bash -lc \
+              '/vedup/bin/setup --non-interactive --profile server --no-shell-change' 2>&1)" && exit 1
+          grep -q 'Amazon Linux 2 reached end-of-support' <<< "$output"

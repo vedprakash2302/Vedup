@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# These values are replaced by the release workflow. The published bootstrap is
+# intentionally immutable: it always downloads one archive with one checksum.
+VEDUP_RELEASE_REF="__VEDUP_RELEASE_REF__"
+VEDUP_RELEASE_COMMIT="__VEDUP_RELEASE_COMMIT__"
+VEDUP_ARCHIVE_SHA256="__VEDUP_ARCHIVE_SHA256__"
+VEDUP_REPOSITORY="${VEDUP_REPOSITORY:-__VEDUP_RELEASE_REPOSITORY__}"
+VEDUP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vedup"
+VEDUP_RELEASES_DIR="$VEDUP_DATA_HOME/releases"
+VEDUP_CURRENT_LINK="$VEDUP_DATA_HOME/current"
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'
+  CYAN=$'\033[36m'
+  RED=$'\033[31m'
+  RESET=$'\033[0m'
+else
+  BOLD="" CYAN="" RED="" RESET=""
+fi
+
+say() { printf '%s\n' "$*"; }
+step() { printf '%s◆%s %s\n' "$CYAN" "$RESET" "$*"; }
+die() { printf '%s✗ ERROR:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+
+say "${BOLD}Vedup${RESET}"
+say ""
+
+if [[ -n "${AUTHOR_MODE:-}" ]]; then
+  die "AUTHOR_MODE is no longer supported by the remote bootstrap. Contributors should clone the repository separately and run ./bin/install."
+fi
+
+case "$VEDUP_RELEASE_REF:$VEDUP_RELEASE_COMMIT:$VEDUP_ARCHIVE_SHA256" in
+  __*|*:__*)
+    die "This source checkout is not a published release bootstrap. Use ./bin/install here, or download bootstrap from a GitHub release."
+    ;;
+esac
+case "$VEDUP_REPOSITORY" in __*) die "The release repository was not embedded in this bootstrap." ;; esac
+[[ "$VEDUP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "The embedded release repository is invalid."
+
+for command_name in bash curl tar find; do
+  command -v "$command_name" >/dev/null 2>&1 || die "$command_name is required."
+done
+
+checksum_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    die "sha256sum or shasum is required to verify the Vedup release."
+  fi
+}
+
+safe_component() {
+  [[ "$1" =~ ^[A-Za-z0-9._+-]+$ ]]
+}
+
+safe_component "$VEDUP_RELEASE_REF" || die "The embedded release tag is invalid."
+safe_component "$VEDUP_RELEASE_COMMIT" || die "The embedded release commit is invalid."
+[[ "$VEDUP_ARCHIVE_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || die "The embedded release checksum is invalid."
+
+release_name="${VEDUP_RELEASE_REF}-${VEDUP_RELEASE_COMMIT:0:12}"
+release_dir="$VEDUP_RELEASES_DIR/$release_name"
+archive_name="vedup-${VEDUP_RELEASE_REF}.tar.gz"
+archive_url="https://github.com/${VEDUP_REPOSITORY}/releases/download/${VEDUP_RELEASE_REF}/${archive_name}"
+
+mkdir -p "$VEDUP_RELEASES_DIR"
+
+release_is_valid() {
+  [[ -x "$release_dir/bin/vedup" && -x "$release_dir/bin/install" && \
+    -x "$release_dir/bin/setup" && -x "$release_dir/bin/doctor" && \
+    -x "$release_dir/bin/update" && -r "$release_dir/.vedup-release" && \
+    -r "$release_dir/.vedup-manifest.sha256" && -r "$release_dir/repository.env" ]] || return 1
+  grep -Fxq "release=$VEDUP_RELEASE_REF" "$release_dir/.vedup-release" && \
+    grep -Fxq "commit=$VEDUP_RELEASE_COMMIT" "$release_dir/.vedup-release" && \
+    grep -Fxq "archive_sha256=$VEDUP_ARCHIVE_SHA256" "$release_dir/.vedup-release" && \
+    (cd "$release_dir" && checksum_verify_manifest .vedup-manifest.sha256)
+}
+
+checksum_verify_manifest() {
+  local manifest="$1"
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum -c "$manifest" >/dev/null 2>&1
+  else shasum -a 256 -c "$manifest" >/dev/null 2>&1; fi
+}
+
+archive_layout_is_safe() {
+  local archive="$1" prefix="vedup-${VEDUP_RELEASE_REF}/"
+  tar -tzf "$archive" | awk -v prefix="$prefix" '
+    $0 !~ "^" prefix { exit 1 }
+    /(^|\/)\.\.?(\/|$)/ || /^\// { exit 1 }
+    END { if (NR == 0) exit 1 }
+  '
+}
+
+payload_links_are_safe() {
+  local root="$1" link target
+  while IFS= read -r link; do
+    target="$(readlink "$link")"
+    case "$target" in /*|..|../*|*/../*|*/..) return 1 ;; esac
+  done < <(find "$root" -type l -print)
+}
+
+if [[ -e "$release_dir" ]] && ! release_is_valid; then
+  die "The immutable release directory exists but failed validation: $release_dir. Move it aside for inspection, then retry."
+fi
+
+if ! release_is_valid; then
+  step "Downloading the verified Vedup release"
+  work_dir="$(mktemp -d "$VEDUP_RELEASES_DIR/.download.XXXXXX")"
+  cleanup() { rm -rf "$work_dir"; }
+  trap cleanup EXIT INT TERM
+
+  archive_path="$work_dir/$archive_name"
+  curl --fail --silent --show-error --location --retry 3 --retry-delay 1 --proto '=https' --tlsv1.2 \
+    "$archive_url" --output "$archive_path"
+
+  actual_checksum="$(checksum_file "$archive_path")"
+  [[ "$actual_checksum" == "$VEDUP_ARCHIVE_SHA256" ]] || \
+    die "Release checksum mismatch. Expected $VEDUP_ARCHIVE_SHA256 but received $actual_checksum."
+  archive_layout_is_safe "$archive_path" || die "The verified archive has an unsafe layout."
+  say "✓ Download verified"
+
+  extract_dir="$work_dir/extracted"
+  mkdir -p "$extract_dir"
+  tar -xzf "$archive_path" -C "$extract_dir"
+
+  payload_dir="$extract_dir/vedup-${VEDUP_RELEASE_REF}"
+  [[ -d "$payload_dir" ]] || payload_dir="$extract_dir"
+  if [[ ! -x "$payload_dir/bin/vedup" || ! -x "$payload_dir/bin/install" || \
+    ! -x "$payload_dir/bin/setup" || ! -x "$payload_dir/bin/doctor" || \
+    ! -x "$payload_dir/bin/update" || ! -r "$payload_dir/repository.env" || \
+    ! -r "$payload_dir/.vedup-manifest.sha256" ]] || \
+    ! payload_links_are_safe "$payload_dir" || \
+    ! (cd "$payload_dir" && checksum_verify_manifest .vedup-manifest.sha256); then
+    die "The verified archive is incomplete."
+  fi
+
+  {
+    printf 'release=%s\n' "$VEDUP_RELEASE_REF"
+    printf 'commit=%s\n' "$VEDUP_RELEASE_COMMIT"
+    printf 'archive_sha256=%s\n' "$VEDUP_ARCHIVE_SHA256"
+  } > "$payload_dir/.vedup-release"
+
+  pending_dir="$VEDUP_RELEASES_DIR/.pending-$release_name-$$"
+  mv "$payload_dir" "$pending_dir"
+  if ! mv "$pending_dir" "$release_dir" 2>/dev/null; then
+    if release_is_valid; then rm -rf "$pending_dir"; else die "Could not install the verified release atomically."; fi
+  fi
+  trap - EXIT INT TERM
+  rm -rf "$work_dir"
+else
+  say "✓ Verified Vedup ${VEDUP_RELEASE_REF} is ready"
+fi
+
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) platform_label="macOS on Apple Silicon" ;;
+  Darwin:*) platform_label="macOS on Intel" ;;
+  Linux:aarch64|Linux:arm64) platform_label="Linux on ARM64" ;;
+  Linux:*) platform_label="Linux on x86_64" ;;
+  *) platform_label="this machine" ;;
+esac
+say "✓ Detected $platform_label"
+step "Starting Vedup"
+export VEDUP_PENDING_RELEASE="$release_dir"
+export VEDUP_CURRENT_LINK
+export VEDUP_RELEASE_REF
+export VEDUP_RELEASE_COMMIT
+if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  exec "$release_dir/bin/install"
+fi
+exec "$release_dir/bin/setup" "$@"

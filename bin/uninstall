@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/state.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/config.sh"
+BACKUP_LIST="$VEDUP_STATE_DIR/backups.list"
+RESTORE=0
+case "$#:${1:-}" in
+  0:) ;;
+  1:--restore-backup) RESTORE=1 ;;
+  *) printf 'Usage: bin/uninstall [--restore-backup]\n' >&2; exit 2 ;;
+esac
+
+state_load "$VEDUP_STATE_FILE" || { printf 'No valid Vedup installation state was found.\n' >&2; exit 1; }
+
+read -r -a packages <<< "$STATE_STOW_PACKAGES"
+DOTFILES_ROOT="$(config_dotfiles_root)"
+for package in "${packages[@]}"; do
+  stow --no-folding --delete --target="$HOME" --dir="$DOTFILES_ROOT" "$package" || true
+done
+
+if [ "$RESTORE" = 1 ] && [ -r "$BACKUP_LIST" ]; then
+  backup_dirs=()
+  while IFS= read -r backup_dir; do [ -n "$backup_dir" ] && backup_dirs+=("$backup_dir"); done < "$BACKUP_LIST"
+  for ((index=0; index < ${#backup_dirs[@]}; index++)); do
+    backup_dir="${backup_dirs[$index]}"
+    [ -d "$backup_dir" ] || continue
+    while IFS= read -r -d '' source; do
+      relative="${source#"$backup_dir"/}"
+      target="$HOME/$relative"
+      if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        mkdir -p "$(dirname "$target")"
+        mv "$source" "$target"
+      else
+        printf 'Not restoring %s because the target exists.\n' "$target" >&2
+      fi
+    done < <(find "$backup_dir" \( -type f -o -type l \) -print0)
+  done
+fi
+
+rm -f "$VEDUP_STATE_FILE" "$VEDUP_RESOURCES_FILE"
+printf 'Vedup configuration links were removed. Installed software and recovery snapshots were left untouched.\n'

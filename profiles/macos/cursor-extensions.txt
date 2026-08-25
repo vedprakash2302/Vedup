@@ -1,0 +1,15 @@
+anysphere.pyright
+bradlc.vscode-tailwindcss
+christian-kohler.path-intellisense
+dsznajder.es7-react-js-snippets
+esbenp.prettier-vscode
+jdinhlife.gruvbox
+ms-azuretools.vscode-containers
+ms-python.debugpy
+ms-python.python
+ms-python.vscode-pylance
+openai.chatgpt
+pkief.material-icon-theme
+tamasfe.even-better-toml
+usernamehw.errorlens
+yoavbls.pretty-ts-errors

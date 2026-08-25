@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[ "$(uname -s)" = Darwin ] || { printf 'macos-restore can only run on macOS.\n' >&2; exit 1; }
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vedup"
+LEDGER="$STATE_DIR/macos-preferences.list"
+BACKUP_DIR="${1:-}"
+
+if [ "$#" -gt 1 ]; then
+  printf 'Usage: bin/macos-restore [backup-directory]\n' >&2
+  exit 2
+fi
+if [ -z "$BACKUP_DIR" ] && [ -r "$LEDGER" ]; then
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] && BACKUP_DIR="$candidate"
+  done < "$LEDGER"
+fi
+if [ -z "$BACKUP_DIR" ] || [ ! -r "$BACKUP_DIR/manifest" ]; then
+  printf 'No valid macOS preference backup was found.\n' >&2
+  exit 1
+fi
+
+while IFS='|' read -r scope domain filename; do
+  if [ "$scope" = flag ]; then
+    chflags "$filename" "$domain"
+    continue
+  fi
+  [ -r "$BACKUP_DIR/$filename" ] || { printf 'Missing backup file: %s\n' "$BACKUP_DIR/$filename" >&2; exit 1; }
+  if [ "$scope" = host ]; then
+    defaults -currentHost import "$domain" "$BACKUP_DIR/$filename"
+  else
+    defaults import "$domain" "$BACKUP_DIR/$filename"
+  fi
+done < "$BACKUP_DIR/manifest"
+
+# Domain imports restore keys that existed. Explicitly delete keys introduced by
+# the failed transaction, including keys in domains that did not exist before.
+if [ -r "$BACKUP_DIR/keys.tsv" ]; then
+  while IFS=$'\t' read -r scope domain key existed; do
+    [ "$existed" = 0 ] || continue
+    [ "$key" != __entire_domain__ ] || { defaults delete "$domain" >/dev/null 2>&1 || true; continue; }
+    if [ "$scope" = host ]; then
+      defaults -currentHost delete "$domain" "$key" >/dev/null 2>&1 || true
+    else
+      defaults delete "$domain" "$key" >/dev/null 2>&1 || true
+    fi
+  done < "$BACKUP_DIR/keys.tsv"
+fi
+
+if [ -x /System/Library/PrivateFrameworks/SystemAdministration.framework/Resources/activateSettings ]; then
+  /System/Library/PrivateFrameworks/SystemAdministration.framework/Resources/activateSettings -u || true
+fi
+killall Dock 2>/dev/null || true
+killall Finder 2>/dev/null || true
+killall SystemUIServer 2>/dev/null || true
+printf 'Restored macOS preferences from %s\n' "$BACKUP_DIR"

@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  validate-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: |
+          brew untap aws/tap 2>/dev/null || true
+          brew install shellcheck stow
+      - run: ./tests/test.sh
+      - run: ./tests/brewfile-validation.sh
+
+  validate-amazon-linux:
+    runs-on: ubuntu-24.04
+    container: amazonlinux:2023
+    steps:
+      - name: Install checkout and test dependencies
+        run: dnf install -y git-core bash findutils gzip tar
+      - uses: actions/checkout@v7
+      - run: ./tests/amazon-linux.sh
+
+  canary-safe-sync-twice:
+    needs: [validate-macos, validate-amazon-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Remove unrelated stale Homebrew tap
+        if: runner.os == 'macOS'
+        run: brew untap aws/tap 2>/dev/null || true
+      - name: Run terminal-profile synchronization twice
+        run: |
+          ./bin/setup --non-interactive --profile server --no-macos-defaults --no-shell-change
+          output="$(./bin/setup --non-interactive --profile server --no-macos-defaults --no-shell-change)"
+          grep -q 'already synchronized; no changes were made' <<< "$output"
+
+  release:
+    needs: [validate-macos, validate-amazon-linux, canary-safe-sync-twice]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck stow zsh
+      - run: ./tests/test.sh
+      - name: Reject secrets in the release history and tree
+        run: ./scripts/scan-secrets --all
+      - name: Build immutable release assets
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p dist
+          stage="$(mktemp -d)"
+          mkdir -p "$stage/vedup-${RELEASE_REF}"
+          git archive --format=tar "$RELEASE_COMMIT" | tar -xf - -C "$stage/vedup-${RELEASE_REF}"
+          (
+            cd "$stage/vedup-${RELEASE_REF}"
+            find . -type f ! -name .vedup-manifest.sha256 -print0 |
+              LC_ALL=C sort -z |
+              xargs -0 sha256sum > .vedup-manifest.sha256
+          )
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -cf - -C "$stage" "vedup-${RELEASE_REF}" | gzip -n > "dist/vedup-${RELEASE_REF}.tar.gz"
+          rm -rf "$stage"
+          ARCHIVE_SHA256="$(sha256sum "dist/vedup-${RELEASE_REF}.tar.gz" | awk '{print $1}')"
+          sed \
+            -e "s/__VEDUP_RELEASE_REF__/$RELEASE_REF/g" \
+            -e "s/__VEDUP_RELEASE_COMMIT__/$RELEASE_COMMIT/g" \
+            -e "s/__VEDUP_ARCHIVE_SHA256__/$ARCHIVE_SHA256/g" \
+            -e "s|__VEDUP_RELEASE_REPOSITORY__|${{ github.repository }}|g" \
+            bootstrap > dist/bootstrap
+          chmod +x dist/bootstrap
+          (cd dist && sha256sum bootstrap "vedup-${RELEASE_REF}.tar.gz" > checksums.txt)
+          grep -q "$RELEASE_REF" dist/bootstrap
+          grep -q "$RELEASE_COMMIT" dist/bootstrap
+          ! grep -q '__VEDUP_' dist/bootstrap
+      - name: Verify release assets and bootstrap behavior
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: ./tests/release-assets.sh dist/bootstrap "dist/vedup-${RELEASE_REF}.tar.gz" dist/checksums.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          assets=(dist/bootstrap "dist/vedup-${tag}.tar.gz" dist/checksums.txt)
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" "${assets[@]}" --clobber && exit 0
+            elif gh release create "$tag" "${assets[@]}" --generate-notes --verify-tag; then
+              exit 0
+            fi
+            [ "$attempt" -eq 5 ] || sleep "$((attempt * 5))"
+          done
+          printf 'GitHub release publication failed after bounded retries.\n' >&2
+          exit 1

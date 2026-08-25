@@ -1,0 +1,32 @@
+# scope	provider	identifier	label	description
+workstation	formula	bitwarden-cli	Bitwarden CLI	Command-line access to the Bitwarden password manager; credentials are never configured by Vedup.
+workstation	formula	mas	Mac App Store CLI	Installs missing App Store applications after you sign in to the Mac App Store.
+workstation	formula	FelixKratz/formulae/borders	Borders	Draws configurable borders around the active window for Aerospace.
+workstation	cask	cursor	Cursor	AI-assisted code editor.
+workstation	cask	ghostty	Ghostty	Fast native terminal emulator.
+workstation	cask	raycast	Raycast	Keyboard-first launcher and productivity utility.
+workstation	cask	docker-desktop	Docker Desktop	Local containers and development environments.
+workstation	cask	nikitabobko/tap/aerospace	Aerospace	Tiling window manager for macOS.
+workstation	cask	font-jetbrains-mono-nerd-font	JetBrains Mono Nerd Font	Developer font with terminal and icon glyphs.
+workstation	cask	chatgpt	ChatGPT	OpenAI desktop application.
+workstation	cask	zed	Zed	Fast collaborative code editor.
+workstation	cask	thebrowsercompany-dia	Dia	AI-oriented web browser.
+workstation	cask	google-chrome	Google Chrome	Web browser and development tools.
+workstation	cask	shottr	Shottr	Screenshot and annotation utility.
+workstation	cask	jump-desktop	Jump Desktop	Remote desktop client.
+workstation	cask	hiddenbar	Hidden Bar	Menu-bar item organizer.
+workstation	cask	logi-options+	Logi Options+	Configuration utility for Logitech devices.
+workstation	cask	focus	Focus	Website and application blocker.
+workstation	cask	linear	Linear	Desktop client for issue tracking and product development.
+workstation	cask	t3-code@nightly	T3 Code Nightly	Nightly desktop client for AI coding agents.
+workstation	mas	937984704	Amphetamine	Keeps the Mac awake for selected periods.
+workstation	mas	1554235898	Peek	Quick file preview utility.
+workstation	mas	6469021132	PDFgear	PDF reader, editor, converter, and signing utility.
+optional	formula	jorgerojas26/lazysql/lazysql	LazySQL	Terminal database client.
+optional	formula	wget	Wget	Command-line network downloader.
+optional	cask	ankerwork	AnkerWork	Configuration utility for AnkerWork devices.
+optional	cask	caffeine	Caffeine	Simple menu-bar sleep prevention utility.
+optional	cask	craft	Craft	Document and note-taking application.
+optional	cask	flux-app	f.lux	Adjusts display color temperature by time of day.
+optional	cask	warp	Warp	Graphical terminal application.
+optional	mas	1552826194	MyWallpaper	Desktop wallpaper application.

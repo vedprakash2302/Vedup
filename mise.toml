@@ -1,0 +1,25 @@
+[settings]
+lockfile = true
+python.compile = false
+
+[tools]
+node = "24.18.0"
+python = "3.14.6"
+"aqua:neovim/neovim" = "0.12.2"
+starship = "1.26.0"
+zoxide = "0.10.0"
+ripgrep = "15.2.0"
+fd = "10.4.2"
+bat = "0.26.1"
+fzf = "0.74.2"
+carapace = "1.7.3"
+jq = "1.8.2"
+yq = "4.53.3"
+delta = "0.19.2"
+lazygit = "0.64.1"
+btop = "1.4.7"
+gh = "2.97.0"
+tree-sitter = "0.26.12"
+tlrc = "1.13.1"
+awscli = "2.36.24"
+lazydocker = "0.25.2"

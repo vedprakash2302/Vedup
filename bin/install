@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/apps.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/state.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/choices.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/config.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/plan.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/versions.env"
+
+DRY_RUN=0
+VERBOSE=0
+UPGRADE_APPS=0
+INSTALL_JOBS=""
+INSTALL_MODE=sync
+SETUP_SCOPE=full
+UI_TOOL=""
+UI_TEMP_DIR=""
+UI_RESULT=""
+UI_WIDTH=72
+TEST_CHOICE_INDEX=0
+IFS='|' read -r -a TEST_CHOICES <<< "${VEDUP_TEST_CHOICES:-}"
+
+usage() {
+  cat <<'EOF'
+Usage: bin/install [options]
+
+Run Vedup's friendly synchronization interface.
+
+  --home          Open the Vedup command menu
+  --customize     Open component choices before synchronization
+  --apps-update   Review existing GUI application updates
+  --advanced      Manage high-impact macOS settings and recovery
+  --dry-run       Preview without changing the machine
+  --verbose       Stream full command output
+  --jobs NUMBER   Override bounded installation concurrency
+
+Use `vedup help --automation` for the non-interactive setup interface.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --home) INSTALL_MODE=home ;;
+    --customize) INSTALL_MODE=customize ;;
+    --apps-update) INSTALL_MODE=apps-update ;;
+    --advanced) INSTALL_MODE=advanced ;;
+    --upgrade-apps) UPGRADE_APPS=1; INSTALL_MODE=apps-update ;;
+    --dry-run) DRY_RUN=1 ;;
+    --verbose) VERBOSE=1 ;;
+    --jobs) [ "$#" -ge 2 ] || die "--jobs requires a value"; INSTALL_JOBS="$2"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown friendly-interface option: $1" ;;
+  esac
+  shift
+done
+if [ -n "$INSTALL_JOBS" ]; then
+  case "$INSTALL_JOBS" in ''|*[!0-9]*) die "--jobs must be a number from 1 to 8" ;; esac
+  if [ "$INSTALL_JOBS" -lt 1 ] || [ "$INSTALL_JOBS" -gt 8 ]; then die "--jobs must be a number from 1 to 8"; fi
+fi
+
+cleanup_ui() {
+  if [ -n "$UI_TEMP_DIR" ]; then
+    case "$UI_TEMP_DIR" in "${TMPDIR:-/tmp}"/vedup-gum.*) rm -rf -- "$UI_TEMP_DIR" ;; esac
+  fi
+  type plan_cleanup >/dev/null 2>&1 && plan_cleanup
+}
+trap cleanup_ui EXIT
+
+normalize_platform() {
+  local machine columns distro_name
+  IS_WSL=0
+  case "${VEDUP_TEST_OS:-$(uname -s)}" in
+    macos|Darwin) OS=macos ;;
+    linux|Linux) OS=linux ;;
+    *) die "Unsupported operating system: $(uname -s)" ;;
+  esac
+  machine="${VEDUP_TEST_ARCH:-$(uname -m)}"
+  case "$machine" in x64|x86_64|amd64) ARCH=x64 ;; arm64|aarch64) ARCH=arm64 ;; *) die "Unsupported architecture: $machine" ;; esac
+  if [ "$OS" = macos ]; then
+    DISTRO=macos
+    DISTRO_VERSION="$(sw_vers -productVersion 2>/dev/null || printf test)"
+    PLATFORM_ADAPTER=macos
+    PLATFORM_NAME="macOS $DISTRO_VERSION / $ARCH"
+  else
+    if [ -n "${VEDUP_TEST_DISTRO:-}" ]; then
+      DISTRO="$VEDUP_TEST_DISTRO"
+      DISTRO_VERSION="${VEDUP_TEST_DISTRO_VERSION:-test}"
+      case "$DISTRO" in
+        ubuntu) distro_name="Ubuntu $DISTRO_VERSION" ;;
+        amzn) distro_name="Amazon Linux $DISTRO_VERSION" ;;
+        *) distro_name="$DISTRO $DISTRO_VERSION" ;;
+      esac
+    elif [ -r /etc/os-release ]; then
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      DISTRO="$ID"; DISTRO_VERSION="${VERSION_ID:-unknown}"; distro_name="${PRETTY_NAME:-$ID}"
+    else
+      die "Cannot identify this Linux distribution."
+    fi
+    vedup_is_wsl && IS_WSL=1
+    PLATFORM_NAME="$distro_name / $ARCH"
+    [ "$IS_WSL" = 0 ] || PLATFORM_NAME="$PLATFORM_NAME (WSL2)"
+    case "$DISTRO" in ubuntu) PLATFORM_ADAPTER=ubuntu ;; amzn) PLATFORM_ADAPTER=amazon ;; *) die "Unsupported Linux distribution: $DISTRO" ;; esac
+    if [ "$DISTRO_VERSION" != test ]; then
+      case "$DISTRO/$DISTRO_VERSION" in
+        ubuntu/22.04|ubuntu/24.04|amzn/2023) ;;
+        amzn/2) die "Amazon Linux 2 is end-of-support. Migrate to Amazon Linux 2023 before running Vedup." ;;
+        *) die "Unsupported Linux release: $DISTRO $DISTRO_VERSION" ;;
+      esac
+    fi
+  fi
+  columns="$(tput cols 2>/dev/null || true)"
+  case "$columns" in ''|*[!0-9]*) ;; *) [ "$columns" -ge 76 ] || [ "$columns" -le 24 ] || UI_WIDTH=$((columns - 4)) ;; esac
+  export OS ARCH DISTRO DISTRO_VERSION PLATFORM_ADAPTER IS_WSL
+}
+
+animated_download() {
+  local url="$1" checksum="$2" archive="$3" pid frame=0
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = dumb ]; then
+    download_verified "$url" "$checksum" "$archive" force
+    return
+  fi
+  (download_verified "$url" "$checksum" "$archive" force) & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r\033[38;5;212m%s\033[0m Preparing the guided interface...' "${frames[$frame]}"
+    frame=$(((frame + 1) % ${#frames[@]})); sleep 0.08
+  done
+  if wait "$pid"; then printf '\r\033[2K\033[38;5;42m✓\033[0m Guided interface ready.\n'; return 0; fi
+  printf '\r\033[2K'; return 1
+}
+
+prepare_gum() {
+  local gum_os gum_arch asset checksum archive extracted
+  [ "${TERM:-}" != dumb ] || return 0
+  if [ -n "${VEDUP_GUM:-}" ] && [ -x "$VEDUP_GUM" ]; then UI_TOOL="$VEDUP_GUM"; return; fi
+  if has gum; then UI_TOOL="$(command -v gum)"; return; fi
+  [ "${VEDUP_NO_GUM_DOWNLOAD:-0}" != 1 ] || return 0
+  has curl && has tar || return 0
+  [ "$OS" = macos ] && gum_os=Darwin || gum_os=Linux
+  [ "$ARCH" = x64 ] && gum_arch=x86_64 || gum_arch=arm64
+  case "$OS/$ARCH" in
+    linux/x64) checksum="$GUM_SHA_LINUX_X64" ;; linux/arm64) checksum="$GUM_SHA_LINUX_ARM64" ;;
+    macos/x64) checksum="$GUM_SHA_MACOS_X64" ;; macos/arm64) checksum="$GUM_SHA_MACOS_ARM64" ;;
+  esac
+  asset="gum_${GUM_VERSION}_${gum_os}_${gum_arch}.tar.gz"
+  UI_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vedup-gum.XXXXXX")"; archive="$UI_TEMP_DIR/$asset"
+  animated_download "https://github.com/charmbracelet/gum/releases/download/v${GUM_VERSION}/$asset" "$checksum" "$archive" || return 0
+  tar -xzf "$archive" -C "$UI_TEMP_DIR" || return 0
+  extracted="$UI_TEMP_DIR/gum_${GUM_VERSION}_${gum_os}_${gum_arch}/gum"
+  [ -f "$extracted" ] || return 0
+  chmod +x "$extracted"; UI_TOOL="$extracted"
+}
+
+ui_title() {
+  if [ -n "$UI_TOOL" ]; then
+    "$UI_TOOL" style --border double --padding "1 3" --margin "1 0" --width "$UI_WIDTH" --align center \
+      --bold --border-foreground 99 --foreground 212 "$1"
+  else printf '\n╔══════════════════════════════════════════════════════════════════════╗\n%s\n╚══════════════════════════════════════════════════════════════════════╝\n' "$1"; fi
+}
+
+ui_intro() {
+  local art content
+  art=$' __     __        _\n \\ \\   / /__  __| |_   _ _ __\n  \\ \\ / / _ \\/ _` | | | | \'_ \\\n   \\ V /  __/ (_| | |_| | |_) |\n    \\_/ \\___|\\__,_|\\__,_| .__/\n                         |_|'
+  if [ -n "$UI_TOOL" ]; then
+    content="$("$UI_TOOL" style --bold --foreground 99 "$art")"$'\n'
+    content+="$("$UI_TOOL" style --bold --foreground 212 'Vedup')"$'\n'
+    content+="$("$UI_TOOL" style --foreground 252 "Nice to meet you! Let's set your machine up!")"
+    "$UI_TOOL" style --border double --padding "1 3" --margin "1 0" --width "$UI_WIDTH" --align center --border-foreground 99 "$content"
+  else printf '\n%s\n\nVedup\nNice to meet you! Let\x27s set your machine up!\n\n' "$art"; fi
+}
+
+ui_heading() {
+  if [ -n "$UI_TOOL" ]; then "$UI_TOOL" style --bold --foreground 86 "◆ $1"; else printf '\n◆ %s\n' "$1"; fi
+}
+ui_text() { printf '%s\n' "$*"; }
+ui_risk_heading() {
+  local level="$1" title="$2" color label
+  case "$level" in destructive) color=196; label=DESTRUCTIVE ;; advanced) color=214; label=ADVANCED ;; esac
+  if [ -n "$UI_TOOL" ]; then "$UI_TOOL" style --bold --foreground "$color" "▲ $label  $title"; else printf '\n▲ %s — %s\n' "$label" "$title"; fi
+}
+ui_plan_row() {
+  local label="$1" value="$2" state="$3" color=252 line
+  case "$state" in enabled) color=42 ;; warning) color=214 ;; skipped) color=245 ;; esac
+  printf -v line '%-18s %s' "$label" "$value"
+  if [ -n "$UI_TOOL" ]; then "$UI_TOOL" style --foreground "$color" "$line"; else printf '%s\n' "$line"; fi
+}
+
+ui_choose() {
+  local header="$1" answer index=1 option
+  local -a options=()
+  shift; options=("$@")
+  if [ -n "${VEDUP_TEST_CHOICES:-}" ]; then
+    [ "$TEST_CHOICE_INDEX" -lt "${#TEST_CHOICES[@]}" ] || die "Test choice queue exhausted at: $header"
+    UI_RESULT="${TEST_CHOICES[$TEST_CHOICE_INDEX]}"; TEST_CHOICE_INDEX=$((TEST_CHOICE_INDEX + 1)); return
+  fi
+  if [ -n "$UI_TOOL" ]; then
+    UI_RESULT="$("$UI_TOOL" choose --header "$header" --height 10 --cursor '❯ ' --cursor.foreground 212 \
+      --header.foreground 86 --item.foreground 252 --selected.foreground 212 "${options[@]}")" || die "Selection cancelled."
+    return
+  fi
+  printf '\n%s\n' "$header" >/dev/tty
+  for option in "${options[@]}"; do printf '  %s) %s\n' "$index" "$option" >/dev/tty; index=$((index + 1)); done
+  while :; do
+    printf 'Choose 1-%s: ' "$#" >/dev/tty; IFS= read -r answer </dev/tty || die "Selection cancelled."
+    case "$answer" in *[!0-9]*|'') ;; *)
+      if [ "$answer" -ge 1 ] && [ "$answer" -le "$#" ]; then UI_RESULT="${options[$((answer - 1))]}"; return; fi ;;
+    esac
+  done
+}
+
+ui_selection_has() {
+  local wanted="$1" selected
+  [ "$UI_RESULT" != all ] || return 0
+  [ "$UI_RESULT" != none ] && [ -n "$UI_RESULT" ] || return 1
+  while IFS= read -r selected; do [ "$selected" != "$wanted" ] || return 0; done < <(printf '%s\n' "$UI_RESULT" | tr ',' '\n')
+  return 1
+}
+
+ui_choose_many() {
+  local header="$1" defaults="$2" answer index=1 option chosen="" marker
+  local -a options=()
+  shift 2; options=("$@")
+  if [ -n "${VEDUP_TEST_CHOICES:-}" ]; then
+    [ "$TEST_CHOICE_INDEX" -lt "${#TEST_CHOICES[@]}" ] || die "Test choice queue exhausted at: $header"
+    UI_RESULT="${TEST_CHOICES[$TEST_CHOICE_INDEX]}"; TEST_CHOICE_INDEX=$((TEST_CHOICE_INDEX + 1))
+    [ "$UI_RESULT" != default ] || UI_RESULT="$defaults"; return
+  fi
+  if [ -n "$UI_TOOL" ]; then
+    if [ -n "$defaults" ]; then
+      UI_RESULT="$("$UI_TOOL" choose --no-limit --selected "$defaults" --header "$header" --height 16 \
+        --cursor '❯ ' --cursor.foreground 212 --header.foreground 86 --item.foreground 252 \
+        --selected.foreground 42 "${options[@]}")" || die "Selection cancelled."
+    else
+      UI_RESULT="$("$UI_TOOL" choose --no-limit --header "$header" --height 16 --cursor '❯ ' \
+        --cursor.foreground 212 --header.foreground 86 --item.foreground 252 --selected.foreground 42 "${options[@]}")" || die "Selection cancelled."
+    fi
+    return
+  fi
+  printf '\n%s\n' "$header" >/dev/tty
+  for option in "${options[@]}"; do
+    marker=' '; UI_RESULT="$defaults"; ui_selection_has "$option" && marker=x
+    printf '  %s) [%s] %s\n' "$index" "$marker" "$option" >/dev/tty; index=$((index + 1))
+  done
+  printf 'Enter comma-separated numbers, or Enter to keep defaults: ' >/dev/tty
+  IFS= read -r answer </dev/tty || die "Selection cancelled."
+  if [ -z "$answer" ]; then UI_RESULT="$defaults"; return; fi
+  while IFS= read -r index; do
+    case "$index" in ''|*[!0-9]*) die "Selections must be comma-separated numbers." ;; esac
+    if [ "$index" -lt 1 ] || [ "$index" -gt "${#options[@]}" ]; then die "Selection $index is outside the available range."; fi
+    chosen="${chosen}${chosen:+$'\n'}${options[$((index - 1))]}"
+  done < <(printf '%s\n' "$answer" | tr ',' '\n')
+  UI_RESULT="$chosen"
+}
+
+ask_yes_no() {
+  local default="$1" heading="$2"
+  if [ "$default" = yes ]; then ui_choose "$heading" "Yes — continue" "No — go back"; else ui_choose "$heading" "No — go back" "Yes — continue"; fi
+  case "$UI_RESULT" in yes|Yes*) UI_RESULT=yes ;; no|No*) UI_RESULT=no ;; *) die "Unexpected selection: $UI_RESULT" ;; esac
+}
+
+load_saved_state() {
+  PROFILE="$STATE_PROFILE"; WITH_AWS="$STATE_WITH_AWS"; WITH_DOCKER="$STATE_WITH_DOCKER"
+  WITH_PERSONAL_APPS="$STATE_WITH_PERSONAL_APPS"; APPLY_MACOS_DEFAULTS="$STATE_APPLY_MACOS_DEFAULTS"
+  MINIMAL_DOCK="$STATE_MINIMAL_DOCK"; KEYBOARD_SHORTCUTS="$STATE_KEYBOARD_SHORTCUTS"
+  EXPERIMENTAL_MACOS_DEFAULTS="$STATE_EXPERIMENTAL_MACOS_DEFAULTS"; CHANGE_SHELL="$STATE_CHANGE_SHELL"
+}
+
+initialize_installer_state() {
+  if [ "$OS" = macos ]; then PROFILE=workstation; APPLY_MACOS_DEFAULTS=1; else PROFILE=server; APPLY_MACOS_DEFAULTS=0; fi
+  WITH_AWS=0; WITH_DOCKER=0; WITH_PERSONAL_APPS=0; MINIMAL_DOCK=0; KEYBOARD_SHORTCUTS=0
+  EXPERIMENTAL_MACOS_DEFAULTS=0; CHANGE_SHELL=1; DOTFILES_ONLY=0; SKIP_PLUGINS=0
+  STOW_PACKAGES=(zsh nvim starship tmux scripts); [ "$OS" != macos ] || STOW_PACKAGES+=(aerospace ghostty cursor)
+  DOTFILES_ROOT="$VEDUP_CONFIG_WORKTREE"; export DOTFILES_ROOT
+  state_detect_workflow
+  [ "$STATE_FOUND" != 1 ] || load_saved_state
+  choices_load_or_default || die "Saved application choices are invalid."
+  choices_apply_environment || die "Saved application choices are invalid."
+  WITH_PERSONAL_APPS="$CHOICES_OPTIONAL_BUNDLE"; choices_export
+}
+
+ui_join_defaults() {
+  local output="" option
+  for option in "$@"; do output="${output}${output:+,}$option"; done
+  printf '%s' "$output"
+}
+
+customize_individual_apps() {
+  local scope provider identifier label description resource option default selected defaults_csv="" index
+  local -a resources=() options=() defaults=()
+  ui_title "Choose individual Mac applications"
+  ui_text "New applications inherit their bundle default unless you override them here."
+  while IFS=$'\t' read -r scope provider identifier label description; do
+    resource="$provider:$identifier"; description="${description//,/;}"
+    option="$label [$scope] — $description"
+    resources+=("$resource"); options+=("$option")
+    choices_app_selected "$scope" "$provider" "$identifier" && defaults+=("$option")
+  done < <(apps_each_scope workstation; apps_each_scope optional)
+  [ "${#defaults[@]}" -eq 0 ] || defaults_csv="$(ui_join_defaults "${defaults[@]}")"
+  ui_choose_many "Space selects • Enter saves app choices" "$defaults_csv" "${options[@]}"
+  for ((index=0; index < ${#options[@]}; index++)); do
+    selected=0; ui_selection_has "${options[$index]}" && selected=1
+    case "${options[$index]}" in *"[workstation]"*) default="$CHOICES_WORKSTATION_BUNDLE" ;; *) default="$CHOICES_OPTIONAL_BUNDLE" ;; esac
+    if [ "$selected" = "$default" ]; then choices_clear_matching_override "${resources[$index]}"; else choices_set_override "${resources[$index]}" "$selected"; fi
+  done
+}
+
+customize_components() {
+  local defaults_csv=""
+  local -a options=() selected_defaults=()
+  ui_title "Customize this machine"
+  ui_text "The development environment and Zsh are always included."
+  if [ "$OS" = macos ]; then
+    options+=("Recommended Mac applications" "Safe macOS preferences" "AWS command-line tools" "Optional applications" "Choose individual applications…")
+    [ "$CHOICES_WORKSTATION_BUNDLE" != 1 ] || selected_defaults+=("Recommended Mac applications")
+    [ "$APPLY_MACOS_DEFAULTS" != 1 ] || selected_defaults+=("Safe macOS preferences")
+    [ "$WITH_AWS" != 1 ] || selected_defaults+=("AWS command-line tools")
+    [ "$CHOICES_OPTIONAL_BUNDLE" != 1 ] || selected_defaults+=("Optional applications")
+  else
+    options+=("AWS command-line tools" "Docker Engine")
+    [ "$WITH_AWS" != 1 ] || selected_defaults+=("AWS command-line tools")
+    [ "$WITH_DOCKER" != 1 ] || selected_defaults+=("Docker Engine")
+  fi
+  [ "${#selected_defaults[@]}" -eq 0 ] || defaults_csv="$(ui_join_defaults "${selected_defaults[@]}")"
+  ui_choose_many "Space selects • Enter continues" "$defaults_csv" "${options[@]}"
+  if [ "$OS" = macos ]; then
+    ui_selection_has "Recommended Mac applications" && CHOICES_WORKSTATION_BUNDLE=1 || CHOICES_WORKSTATION_BUNDLE=0
+    ui_selection_has "Safe macOS preferences" && APPLY_MACOS_DEFAULTS=1 || APPLY_MACOS_DEFAULTS=0
+    ui_selection_has "AWS command-line tools" && WITH_AWS=1 || WITH_AWS=0
+    ui_selection_has "Optional applications" && CHOICES_OPTIONAL_BUNDLE=1 || CHOICES_OPTIONAL_BUNDLE=0
+    ui_selection_has "Choose individual applications…" && customize_individual_apps
+  else
+    ui_selection_has "AWS command-line tools" && WITH_AWS=1 || WITH_AWS=0
+    ui_selection_has "Docker Engine" && WITH_DOCKER=1 || WITH_DOCKER=0
+  fi
+  WITH_PERSONAL_APPS="$CHOICES_OPTIONAL_BUNDLE"; choices_export
+}
+
+build_setup_args() {
+  SETUP_ARGS=(--profile "$PROFILE")
+  [ "$WITH_AWS" = 1 ] && SETUP_ARGS+=(--with-aws) || SETUP_ARGS+=(--without-aws)
+  [ "$WITH_DOCKER" = 1 ] && SETUP_ARGS+=(--with-docker) || SETUP_ARGS+=(--without-docker)
+  [ "$WITH_PERSONAL_APPS" = 1 ] && SETUP_ARGS+=(--with-personal-apps) || SETUP_ARGS+=(--without-personal-apps)
+  if [ "$OS" = macos ]; then [ "$APPLY_MACOS_DEFAULTS" = 1 ] && SETUP_ARGS+=(--macos-defaults) || SETUP_ARGS+=(--no-macos-defaults); fi
+  [ "$MINIMAL_DOCK" = 1 ] && SETUP_ARGS+=(--minimal-dock) || SETUP_ARGS+=(--no-minimal-dock)
+  [ "$KEYBOARD_SHORTCUTS" = 1 ] && SETUP_ARGS+=(--keyboard-shortcuts) || SETUP_ARGS+=(--no-keyboard-shortcuts)
+  [ "$EXPERIMENTAL_MACOS_DEFAULTS" = 1 ] && SETUP_ARGS+=(--experimental-macos-defaults) || SETUP_ARGS+=(--no-experimental-macos-defaults)
+  SETUP_ARGS+=(--shell-change)
+  [ "$DRY_RUN" != 1 ] || SETUP_ARGS+=(--dry-run)
+  [ "$VERBOSE" != 1 ] || SETUP_ARGS+=(--verbose)
+  [ -z "$INSTALL_JOBS" ] || SETUP_ARGS+=(--jobs "$INSTALL_JOBS")
+  [ "$SETUP_SCOPE" = full ] || SETUP_ARGS+=(--scope "$SETUP_SCOPE")
+}
+
+release_activation_needed() {
+  [ -n "${VEDUP_PENDING_RELEASE:-}" ] && [ -n "${VEDUP_CURRENT_LINK:-}" ] || return 1
+  [ -L "$VEDUP_CURRENT_LINK" ] && [ "$(readlink "$VEDUP_CURRENT_LINK" 2>/dev/null || true)" = "$VEDUP_PENDING_RELEASE" ] && return 1
+  return 0
+}
+
+print_plan_summary() {
+  local title
+  if [ "$STATE_WORKFLOW" = interrupted ]; then title="Resume setting up $PLATFORM_NAME"
+  elif [ "$STATE_WORKFLOW" = managed ]; then title="Ready to synchronize $PLATFORM_NAME"
+  else title="Ready to set up $PLATFORM_NAME"; fi
+  ui_title "$title"
+  ui_text "✓ Development tools, terminal configuration and Zsh"
+  if [ "$OS" = macos ]; then
+    if [ "$CHOICES_WORKSTATION_BUNDLE" = 1 ]; then ui_text "✓ Recommended Mac applications"; else ui_text "– Recommended Mac applications not selected"; fi
+    if [ "$APPLY_MACOS_DEFAULTS" = 1 ]; then ui_text "✓ Safe macOS preferences"; else ui_text "– Safe macOS preferences not selected"; fi
+  fi
+  [ "$WITH_AWS" != 1 ] || ui_text "✓ AWS command-line tools"
+  if [ "$OS" = linux ] && [ "$WITH_DOCKER" = 1 ]; then ui_text "✓ Docker Engine"; fi
+  ui_text ""
+  [ "$PLAN_INSTALL_COUNT" -eq 0 ] || ui_plan_row "Install" "$PLAN_INSTALL_COUNT missing item(s)" enabled
+  [ "$PLAN_UPDATE_COUNT" -eq 0 ] || ui_plan_row "Update" "$PLAN_UPDATE_COUNT Vedup item(s)" enabled
+  [ "$PLAN_CONFIGURE_COUNT" -eq 0 ] || ui_plan_row "Configure" "$PLAN_CONFIGURE_COUNT setting group(s)" enabled
+  release_activation_needed && ui_plan_row "Vedup" "activate the verified release" enabled
+  [ "$PLAN_KEEP_COUNT" -eq 0 ] || ui_plan_row "Already ready" "$PLAN_KEEP_COUNT existing item(s) preserved" skipped
+  [ "$PLAN_REVIEW_COUNT" -eq 0 ] || ui_plan_row "Needs attention" "$PLAN_REVIEW_COUNT item(s) require review" warning
+  [ "$PLAN_CONFLICT_COUNT" -eq 0 ] || ui_plan_row "Backups" "$PLAN_CONFLICT_COUNT conflict(s) will be protected" warning
+  if [ "$DRY_RUN" != 1 ] && [ "$PLAN_NEEDS_SUDO" = 1 ]; then ui_plan_row "Approval" "administrator approval may be requested once" warning; fi
+}
+
+show_plan_details() {
+  ui_heading "Individual changes"
+  awk -F '\t' '$1 != "keep" { printf "  %-10s %-28s %s\n", $1, $2, $7 }' "$PLAN_FILE"
+  ui_text ""; ui_text "Existing compatible software is preserved. Normal synchronization never"
+  ui_text "performs general GUI application or operating-system upgrades."
+}
+
+print_test_args() {
+  [ "${VEDUP_INSTALLER_PRINT_ARGS:-0}" = 1 ] || return 1
+  printf 'SETUP_ARGS'; printf ' %q' "${SETUP_ARGS[@]}"; printf '\n'
+  printf 'CHOICES workstation=%s optional=%s overrides=%s\n' "$CHOICES_WORKSTATION_BUNDLE" \
+    "$CHOICES_OPTIONAL_BUNDLE" "$(printf '%s' "$CHOICES_APP_OVERRIDES" | tr '\n' ',')"
+}
+
+execute_setup() {
+  choices_export; cleanup_ui; UI_TEMP_DIR=""
+  exec "$REPO_ROOT/bin/setup" "${SETUP_ARGS[@]}"
+}
+
+run_sync_flow() {
+  local customize_first="${1:-0}" action_label
+  [ "$customize_first" != 1 ] || customize_components
+  while :; do
+    build_setup_args; plan_generate
+    if print_test_args; then return 0; fi
+    if [ "$STATE_WORKFLOW" = managed ] && [ "$PLAN_INSTALL_COUNT" -eq 0 ] && [ "$PLAN_UPDATE_COUNT" -eq 0 ] && \
+      [ "$PLAN_CONFIGURE_COUNT" -eq 0 ] && [ "$PLAN_CONFLICT_COUNT" -eq 0 ] && [ "$PLAN_REVIEW_COUNT" -eq 0 ] && ! release_activation_needed; then
+      ui_title "Welcome back!"; ui_text "✓ Vedup is current"; ui_text "✓ Applications are present"
+      ui_text "✓ Configuration is synchronized"; ui_text ""; ui_text "Everything is ready. No changes were made."; return 0
+    fi
+    print_plan_summary
+    [ "$STATE_WORKFLOW" = managed ] && action_label="Sync this machine" || action_label="Set up this machine"
+    ui_choose "What would you like to do?" "$action_label" "Customize" "Show details" "Exit"
+    case "$UI_RESULT" in
+      Sync*|Set*) execute_setup ;; Customize*) customize_components ;; Show*) show_plan_details ;; Exit*) return 0 ;;
+      *) die "Unexpected selection: $UI_RESULT" ;;
+    esac
+  done
+}
+
+run_app_updates() {
+  local scope provider identifier label description token selected_upgrades="" index
+  local -a options=() tokens=()
+  [ "$OS" = macos ] || die "Application updates are currently available only on macOS."
+  [ "$STATE_WORKFLOW" = managed ] || die "Synchronize this Mac once before using application maintenance."
+  inventory_command_exists brew || die "Homebrew is not available yet; synchronize this Mac first."
+  while IFS=$'\t' read -r scope provider identifier label description; do
+    [ "$provider" = cask ] || continue
+    token="${identifier##*/}"; inventory_package_installed cask "$token" || continue; plan_cask_outdated "$token" || continue
+    options+=("$label — ${description//,/;}"); tokens+=("$token")
+  done < <(apps_each_selected)
+  if [ "${#options[@]}" -eq 0 ]; then ui_title "Applications are current"; ui_text "No selected GUI applications need an update."; return 0; fi
+  ui_title "Update applications"; ui_text "Normal synchronization never upgrades existing GUI applications."
+  if [ "$UPGRADE_APPS" = 1 ]; then UI_RESULT=all; else ui_choose_many "Select only the applications to update" "" "${options[@]}"; fi
+  for ((index=0; index < ${#options[@]}; index++)); do
+    [ "$UPGRADE_APPS" = 1 ] || ui_selection_has "${options[$index]}" || continue
+    selected_upgrades="${selected_upgrades}${selected_upgrades:+ }${tokens[$index]}"
+  done
+  [ -n "$selected_upgrades" ] || { ui_text "No updates selected."; return 0; }
+  VEDUP_SELECTED_APP_UPGRADES="$selected_upgrades"; export VEDUP_SELECTED_APP_UPGRADES
+  SETUP_SCOPE=apps; build_setup_args; execute_setup
+}
+
+run_advanced() {
+  local defaults_csv=""
+  local -a selected=()
+  [ "$OS" = macos ] || die "Advanced macOS settings are not available on Linux."
+  [ "$STATE_WORKFLOW" = managed ] || die "Synchronize this Mac once before changing managed advanced settings."
+  ui_title "Advanced macOS controls"; ui_risk_heading destructive "Minimal Dock"
+  ui_text "Removes every pinned Dock application and shows only running apps."
+  ui_risk_heading destructive "Keyboard shortcut snapshot"
+  ui_text "Replaces the complete symbolic-hotkey domain with Vedup's snapshot."
+  ui_risk_heading advanced "Experimental preferences"
+  ui_text "Applies undocumented settings that may change between macOS releases."
+  ui_choose "Choose an advanced action" "Change advanced settings" "Restore latest preference backup" "Back"
+  case "$UI_RESULT" in
+    Restore*) ask_yes_no no "Restore the latest macOS preference backup now?"; [ "$UI_RESULT" = yes ] || return 0
+      cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/macos-restore" ;;
+    Back*) return 0 ;;
+  esac
+  [ "$MINIMAL_DOCK" != 1 ] || selected+=("Minimal Dock")
+  [ "$KEYBOARD_SHORTCUTS" != 1 ] || selected+=("Keyboard shortcut snapshot")
+  [ "$EXPERIMENTAL_MACOS_DEFAULTS" != 1 ] || selected+=("Experimental macOS preferences")
+  [ "${#selected[@]}" -eq 0 ] || defaults_csv="$(ui_join_defaults "${selected[@]}")"
+  ui_choose_many "Space selects • Enter continues" "$defaults_csv" "Minimal Dock" "Keyboard shortcut snapshot" "Experimental macOS preferences"
+  ui_selection_has "Minimal Dock" && MINIMAL_DOCK=1 || MINIMAL_DOCK=0
+  ui_selection_has "Keyboard shortcut snapshot" && KEYBOARD_SHORTCUTS=1 || KEYBOARD_SHORTCUTS=0
+  ui_selection_has "Experimental macOS preferences" && EXPERIMENTAL_MACOS_DEFAULTS=1 || EXPERIMENTAL_MACOS_DEFAULTS=0
+  if [ "$MINIMAL_DOCK" = 1 ] || [ "$KEYBOARD_SHORTCUTS" = 1 ] || [ "$EXPERIMENTAL_MACOS_DEFAULTS" = 1 ]; then APPLY_MACOS_DEFAULTS=1; fi
+  SETUP_SCOPE=macos-preferences; build_setup_args; execute_setup
+}
+
+run_home() {
+  local -a options=("Sync this machine" "Customize setup" "Save local changes" "Update Vedup")
+  [ "$OS" != macos ] || options+=("Update applications")
+  options+=("Diagnose a problem"); [ "$OS" != macos ] || options+=("Advanced"); options+=("Exit")
+  ui_title "What would you like to do?"; ui_choose "Vedup" "${options[@]}"
+  case "$UI_RESULT" in
+    Sync*) run_sync_flow 0 ;; Customize*) run_sync_flow 1 ;;
+    Save*) cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/capture" ;;
+    "Update Vedup") cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/update" ;;
+    "Update applications") run_app_updates ;; Diagnose*) cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/doctor" ;;
+    Advanced*) run_advanced ;; Exit*) return 0 ;;
+  esac
+}
+
+main() {
+  if [ -z "${VEDUP_TEST_CHOICES:-}" ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+    die "The friendly interface needs a terminal. Use bin/setup flags for automation."
+  fi
+  normalize_platform
+  if [ -z "${VEDUP_TEST_CHOICES:-}" ] && ! has gum; then printf 'Preparing the installer interface...\n'; fi
+  prepare_gum; ui_intro; ui_text "Detected: $PLATFORM_NAME"; initialize_installer_state
+  case "$INSTALL_MODE" in
+    sync) run_sync_flow 0 ;; customize) run_sync_flow 1 ;; apps-update) run_app_updates ;; advanced) run_advanced ;; home) run_home ;;
+  esac
+}
+
+main

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Reject secrets in history and the current tree
+        run: ./scripts/scan-secrets --all
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck stow zsh
+          else
+            # GitHub's macOS image can retain an unrelated untrusted AWS tap;
+            # remove it from this disposable runner before invoking Homebrew.
+            brew untap aws/tap 2>/dev/null || true
+            brew install shellcheck stow
+          fi
+      - run: ./tests/test.sh
+      - name: Validate application manifest providers without installing applications
+        if: runner.os == 'macOS'
+        run: ./tests/brewfile-validation.sh
+
+  amazon-linux:
+    runs-on: ubuntu-24.04
+    container: amazonlinux:2023
+    steps:
+      - name: Install checkout and test dependencies
+        run: dnf install -y git-core bash findutils gzip tar
+      - uses: actions/checkout@v7
+      - name: Validate Amazon Linux provider
+        run: ./tests/amazon-linux.sh

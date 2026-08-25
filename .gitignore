@@ -1,0 +1,32 @@
+# Local credentials and private overrides never belong in source control.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials
+credentials.*
+*.credentials
+secrets
+secrets.*
+*.secrets
+*.local
+*.local.*
+.zsh_history
+.bash_history
+.python_history
+.node_repl_history
+history
+*.history
+.DS_Store
+
+# Generated output and operating-system metadata.
+.vedup-state/
+logs/
+backups/
+dist/

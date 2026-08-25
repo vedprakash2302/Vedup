@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/common.sh"
+
+UPDATE_REPOSITORY="$(vedup_repository)" || die "Vedup's update repository is invalid."
+BOOTSTRAP_URL="${VEDUP_BOOTSTRAP_URL:-https://github.com/${UPDATE_REPOSITORY}/releases/latest/download/bootstrap}"
+VEDUP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vedup"
+VEDUP_RELEASES_DIR="$VEDUP_DATA_HOME/releases"
+VEDUP_CURRENT_LINK="$VEDUP_DATA_HOME/current"
+VEDUP_APPLIED_LINK="$VEDUP_DATA_HOME/applied"
+UPDATE_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/vedup-update.XXXXXX")"
+DRY_RUN=0
+SETUP_SUCCESS=0
+
+update_cleanup() {
+  local exit_code="$?"
+  case "$UPDATE_TEMP" in "${TMPDIR:-/tmp}"/vedup-update.*) rm -rf -- "$UPDATE_TEMP" ;; esac
+  setup_lock_release
+  return "$exit_code"
+}
+trap update_cleanup EXIT
+trap 'exit 130' INT TERM
+
+die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+checksum_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else die "sha256sum or shasum is required to verify the update."; fi
+}
+metadata_value() {
+  local key="$1" file="$2" value count
+  count="$(grep -Ec "^${key}=\"[^\"]+\"$" "$file" || true)"
+  [ "$count" = 1 ] || return 1
+  value="$(sed -n "s/^${key}=\"\([^\"]*\)\"$/\\1/p" "$file")"
+  printf '%s' "$value"
+}
+release_is_valid() {
+  [ -x "$release_dir/bin/vedup" ] && [ -x "$release_dir/bin/install" ] && \
+    [ -x "$release_dir/bin/setup" ] && [ -x "$release_dir/bin/doctor" ] && \
+    [ -x "$release_dir/bin/update" ] && [ -r "$release_dir/.vedup-release" ] && \
+    [ -r "$release_dir/.vedup-manifest.sha256" ] && [ -r "$release_dir/repository.env" ] || return 1
+  grep -Fxq "release=$release_ref" "$release_dir/.vedup-release" && \
+    grep -Fxq "commit=$release_commit" "$release_dir/.vedup-release" && \
+    grep -Fxq "archive_sha256=$archive_sha256" "$release_dir/.vedup-release" && \
+    (cd "$release_dir" && checksum_verify_manifest .vedup-manifest.sha256)
+}
+
+checksum_verify_manifest() {
+  local manifest="$1"
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum -c "$manifest" >/dev/null 2>&1
+  else shasum -a 256 -c "$manifest" >/dev/null 2>&1; fi
+}
+
+archive_layout_is_safe() {
+  local archive="$1" prefix="vedup-${release_ref}/"
+  tar -tzf "$archive" | awk -v prefix="$prefix" '
+    $0 !~ "^" prefix { exit 1 }
+    /(^|\/)\.\.?(\/|$)/ || /^\// { exit 1 }
+    END { if (NR == 0) exit 1 }
+  '
+}
+
+payload_links_are_safe() {
+  local root="$1" link target
+  while IFS= read -r link; do
+    target="$(readlink "$link")"
+    case "$target" in /*|..|../*|*/../*|*/..) return 1 ;; esac
+  done < <(find "$root" -type l -print)
+}
+
+for command_name in curl tar find; do command -v "$command_name" >/dev/null 2>&1 || die "$command_name is required."; done
+mkdir -p "$VEDUP_RELEASES_DIR"
+setup_lock_acquire
+trap update_cleanup EXIT
+trap 'exit 130' INT TERM
+
+printf 'Checking for a Vedup update…\n'
+bootstrap="$UPDATE_TEMP/bootstrap"
+curl --fail --silent --show-error --location --retry 3 --retry-delay 1 \
+  --proto '=https' --tlsv1.2 "$BOOTSTRAP_URL" --output "$bootstrap"
+
+release_ref="$(metadata_value VEDUP_RELEASE_REF "$bootstrap" || true)"
+release_commit="$(metadata_value VEDUP_RELEASE_COMMIT "$bootstrap" || true)"
+archive_sha256="$(metadata_value VEDUP_ARCHIVE_SHA256 "$bootstrap" || true)"
+[[ "$release_ref" =~ ^v[0-9A-Za-z._+-]+$ ]] || die "The published update has an invalid release tag. Nothing was changed."
+[[ "$release_commit" =~ ^[0-9a-f]{40}$ ]] || die "The published update has an invalid commit. Nothing was changed."
+[[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]] || die "The published update has an invalid checksum. Nothing was changed."
+
+release_name="$release_ref-${release_commit:0:12}"
+release_dir="$VEDUP_RELEASES_DIR/$release_name"
+current_target="$(readlink "$VEDUP_CURRENT_LINK" 2>/dev/null || true)"
+if [ "$current_target" = "$release_dir" ] && release_is_valid; then
+  printf '✓ Vedup %s is already current.\n' "$release_ref"
+  exit 0
+fi
+
+if [ -e "$release_dir" ] && ! release_is_valid; then
+  die "The release directory exists but failed validation: $release_dir"
+fi
+
+if ! release_is_valid; then
+  archive_name="vedup-${release_ref}.tar.gz"
+  archive="$UPDATE_TEMP/$archive_name"
+  archive_url="${BOOTSTRAP_URL%/releases/latest/download/bootstrap}/releases/download/${release_ref}/${archive_name}"
+  curl --fail --silent --show-error --location --retry 3 --retry-delay 1 \
+    --proto '=https' --tlsv1.2 "$archive_url" --output "$archive"
+  [ "$(checksum_file "$archive")" = "$archive_sha256" ] || die "The update archive checksum did not match. Nothing was changed."
+  archive_layout_is_safe "$archive" || die "The verified update archive has an unsafe layout. Nothing was changed."
+
+  extract_root="$UPDATE_TEMP/extracted"
+  mkdir -p "$extract_root"
+  tar -xzf "$archive" -C "$extract_root"
+  payload="$extract_root/vedup-${release_ref}"
+  [ -d "$payload" ] || payload="$extract_root"
+  if [ ! -x "$payload/bin/vedup" ] || [ ! -x "$payload/bin/install" ] || \
+    [ ! -x "$payload/bin/setup" ] || [ ! -x "$payload/bin/doctor" ] || \
+    [ ! -x "$payload/bin/update" ] || [ ! -r "$payload/.vedup-manifest.sha256" ] || \
+    [ ! -r "$payload/repository.env" ] || \
+    ! payload_links_are_safe "$payload" || \
+    ! (cd "$payload" && checksum_verify_manifest .vedup-manifest.sha256); then
+    die "The verified update archive is incomplete. Nothing was changed."
+  fi
+  {
+    printf 'release=%s\n' "$release_ref"
+    printf 'commit=%s\n' "$release_commit"
+    printf 'archive_sha256=%s\n' "$archive_sha256"
+  } > "$payload/.vedup-release"
+  pending="$VEDUP_RELEASES_DIR/.pending-$release_name-$$"
+  mv "$payload" "$pending"
+  if ! mv "$pending" "$release_dir" 2>/dev/null; then
+    release_is_valid || die "The verified update could not be installed atomically."
+  fi
+fi
+
+command_link="$HOME/.local/bin/vedup"
+if [ -e "$command_link" ] || [ -L "$command_link" ]; then
+  vedup_launcher_is_managed "$command_link" || \
+    die "$command_link is not managed by Vedup. Nothing was activated; move it aside and retry."
+fi
+vedup_install_launcher "$command_link"
+
+# `current` selects the Vedup CLI. `applied` selects the configuration and
+# Mise policy currently proven on this machine. Older v1 installs had only
+# `current`; preserve that exact release before changing the CLI pointer.
+if [ ! -L "$VEDUP_APPLIED_LINK" ] && [ -L "$VEDUP_CURRENT_LINK" ]; then
+  previous_current="$(readlink "$VEDUP_CURRENT_LINK")"
+  temporary_applied="$VEDUP_APPLIED_LINK.new.$$"
+  ln -s "$previous_current" "$temporary_applied"
+  mv -f "$temporary_applied" "$VEDUP_APPLIED_LINK"
+fi
+
+temporary_link="$VEDUP_CURRENT_LINK.new.$$"
+ln -s "$release_dir" "$temporary_link"
+if mv -Tf "$temporary_link" "$VEDUP_CURRENT_LINK" 2>/dev/null; then :
+elif mv -fh "$temporary_link" "$VEDUP_CURRENT_LINK" 2>/dev/null; then :
+else
+  rm -f "$temporary_link"
+  die "The update was verified but could not be activated. The previous Vedup remains active."
+fi
+
+"$command_link" help >/dev/null || die "The new Vedup command failed its activation check."
+SETUP_SUCCESS=1
+
+printf '✓ Vedup updated to %s.\n' "$release_ref"
+printf '  Update repository: https://github.com/%s\n' "$UPDATE_REPOSITORY"
+printf '  Machine tools and settings were not changed. Run vedup sync when you want to apply setup updates.\n'

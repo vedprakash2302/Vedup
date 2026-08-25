@@ -1,0 +1,82 @@
+{
+  "explorer.confirmDelete": false,
+  "editor.fontSize": 14,
+  "editor.fontFamily": "'JetBrainsMono Nerd Font', Menlo, Monaco, 'Courier New', monospace",
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "files.autoSave": "afterDelay",
+  "git.confirmSync": false,
+  "prettier.printWidth": 120,
+  "security.promptForLocalFileProtocolHandling": false,
+  "cursor.cpp.enablePartialAccepts": true,
+  "cursor.composer.shouldAutoScrollToBottom": false,
+  "cursor.cmdk.useThemedDiffBackground": true,
+  "cursor.composer.collapsePaneInputBoxPills": true,
+  "cursor.general.gitGraphIndexing": "enabled",
+  "cursor.terminal.usePreviewBox": true,
+  "git.ignoreRebaseWarning": true,
+  "database-client.autoSync": true,
+  "editor.tabSize": 2,
+  "typescript.updateImportsOnFileMove.enabled": "always",
+  "typescript.preferences.includePackageJsonAutoImports": "auto",
+  "typescript.suggest.autoImports": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "always"
+  },
+  "files.exclude": {
+    "**/.turbo": true,
+    "**/node_modules": true
+  },
+  "workbench.activityBar.location": "hidden",
+  "workbench.editor.editorActionsLocation": "hidden",
+  "vsicons.dontShowNewVersionMessage": true,
+  "editor.minimap.enabled": true,
+  "python.languageServer": "None",
+  "git.mergeEditor": true,
+  "diffEditor.renderSideBySide": true,
+  "cursor.composer.shouldAllowCustomModes": true,
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml"
+  },
+  "python.analysis.packageIndexDepths": [
+    {
+      "name": "sklearn",
+      "depth": 2
+    },
+    {
+      "name": "matplotlib",
+      "depth": 2
+    },
+    {
+      "name": "scipy",
+      "depth": 2
+    },
+    {
+      "name": "django",
+      "depth": 2
+    },
+    {
+      "name": "flask",
+      "depth": 2
+    },
+    {
+      "name": "fastapi",
+      "depth": 2
+    }
+  ],
+  "makefile.configureOnOpen": false,
+  "cursor.windowSwitcher.sidebarHoverCollapsed": true,
+  "javascript.updateImportsOnFileMove.enabled": "always",
+  "debug.javascript.autoAttachFilter": "onlyWithFlag",
+  "explorer.compactFolders": false,
+  "explorer.confirmDragAndDrop": false,
+  "editor.fontLigatures": false,
+  "workbench.colorTheme": "Gruvbox Dark Medium",
+  "symbols.hidesExplorerArrows": false,
+  "workbench.iconTheme": "material-icon-theme",
+  "editor.minimap.renderCharacters": false,
+  "editor.minimap.size": "fit",
+  "editor.minimap.showSlider": "always",
+  "yaml.maxItemsComputed": 50000
+}

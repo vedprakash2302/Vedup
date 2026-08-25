@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2015,SC2034
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/versions.env"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/state.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/choices.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/apps.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/config.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/plan.sh"
+export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+export MISE_CONFIG_FILE="${VEDUP_APPLIED_RELEASE:-$REPO_ROOT}/mise.toml"
+failures=0
+QUICK=0
+DOTFILES_ONLY=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in --quick) QUICK=1 ;; --dotfiles-only) DOTFILES_ONLY=1 ;; *) printf 'Usage: bin/doctor [--quick] [--dotfiles-only]\n' >&2; exit 2 ;; esac
+  shift
+done
+
+ok() { printf '[doctor] OK: %s\n' "$*"; }
+note() { printf '[doctor] NOTE: %s\n' "$*"; }
+fail() { printf '[doctor] FAIL: %s\n' "$*" >&2; failures=$((failures + 1)); }
+
+plugin_destination() {
+  local name="$1" zsh_root="${XDG_DATA_HOME:-$HOME/.local/share}/vedup/zsh/plugins" tmux_root="$HOME/.tmux/plugins"
+  case "$name" in
+    zsh-autosuggestions|zsh-syntax-highlighting|zsh-history-substring-search|zsh-completions|zsh-you-should-use|git-alias)
+      printf '%s/%s' "$zsh_root" "$name" ;;
+    tpm|vim-tmux-navigator|tmux-resurrect|tmux-continuum|tmux-sensible|tmux-online-status|tmux-battery)
+      printf '%s/%s' "$tmux_root" "$name" ;;
+    tmux-catppuccin) printf '%s/tmux' "$tmux_root" ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_dotfile_links() {
+  local package package_dir source relative target
+  DOTFILES_ROOT="$(config_dotfiles_root)"
+  read -r -a doctor_packages <<< "$STATE_STOW_PACKAGES"
+  for package in "${doctor_packages[@]}"; do
+    package_dir="$DOTFILES_ROOT/$package"
+    [ -d "$package_dir" ] || { fail "managed dotfile package is missing: $package"; continue; }
+    while IFS= read -r -d '' source; do
+      relative="${source#"$package_dir"/}"
+      target="$HOME/$relative"
+      if [ -L "$target" ] && [ "$target" -ef "$source" ]; then :
+      else fail "managed dotfile link is missing or incorrect: $relative"; fi
+    done < <(find "$package_dir" \( -type f -o -type l \) \
+      ! -name .gitignore ! -name .gitmodules ! -name .cvsignore ! -name .DS_Store -print0)
+  done
+}
+
+STATE_INPUT="${VEDUP_STATE_CANDIDATE:-$VEDUP_STATE_FILE}"
+if state_load "$STATE_INPUT"; then
+  ok "Vedup state is valid data (schema 1)"
+else
+  fail "Vedup state is missing or invalid: $STATE_INPUT"
+fi
+if state_validate_resources "$VEDUP_RESOURCES_FILE"; then ok "resource ownership inventory is valid"
+else fail "resource ownership inventory is missing or invalid: $VEDUP_RESOURCES_FILE"; fi
+if apps_manifest_validate; then ok "macOS application manifest is valid and deduplicated"
+else fail "macOS application manifest is invalid: $VEDUP_MACOS_APPS_MANIFEST"; fi
+if choices_validate_file "$VEDUP_CHOICES_FILE" && choices_load "$VEDUP_CHOICES_FILE"; then ok "saved component and application choices are valid data"
+else fail "saved choices are missing or invalid: $VEDUP_CHOICES_FILE"; fi
+
+if [ "${STATE_PLATFORM:-}" = macos ]; then
+  git_path="$(command -v git 2>/dev/null || true)"
+  case "$git_path" in
+    /opt/homebrew/*|/usr/local/Cellar/git/*|/usr/local/opt/git/*)
+      note "Homebrew Git is externally managed and was left unchanged: $git_path"
+      ;;
+    *) [ -n "$git_path" ] && ok "Apple/system Git is available at $git_path" ;;
+  esac
+  note "Vedup does not inspect or change .gitconfig, credential helpers, or Keychain"
+fi
+
+if [ "$DOTFILES_ONLY" = 1 ]; then core_commands=(stow zsh); else core_commands=(git zsh stow mise); fi
+full_commands=(tmux starship zoxide rg fd bat fzf eza carapace jq yq delta lazygit btop gh tree-sitter tldr)
+for command_name in "${core_commands[@]}"; do
+  if command -v "$command_name" >/dev/null 2>&1; then ok "$command_name is available"
+  else fail "$command_name is missing"; fi
+done
+if [ "$QUICK" != 1 ] && [ "$DOTFILES_ONLY" != 1 ]; then
+  for command_name in "${full_commands[@]}"; do
+    if command -v "$command_name" >/dev/null 2>&1; then ok "$command_name is available"
+    else fail "$command_name is missing"; fi
+  done
+fi
+
+if [ "$STATE_FOUND" = 1 ]; then verify_dotfile_links; fi
+if [ -f "$HOME/.local/bin/vedup" ] && grep -Fqx '# vedup-managed-launcher-v2' "$HOME/.local/bin/vedup" 2>/dev/null; then
+  ok "Vedup command launcher is installed"
+elif [ -L "$HOME/.local/bin/vedup" ]; then
+  note "An older Vedup command symlink is installed and will be replaced by the stable launcher"
+else
+  fail "Vedup command launcher is missing from ~/.local/bin"
+fi
+
+if [ "$QUICK" != 1 ] && [ "$STATE_FOUND" = 1 ]; then
+  while IFS=$'\t' read -r resource_action resource_id resource_provider resource_owner resource_current resource_desired resource_description; do
+    [ "$resource_owner" = vedup-managed ] || continue
+    case "$resource_id" in
+      mise)
+        if [ -x "$HOME/.local/bin/mise" ] && \
+          "$HOME/.local/bin/mise" --version 2>/dev/null | grep -Eq "(^| )${resource_desired}([ +]|$)"; then
+          ok "Mise $resource_desired is installed at the managed path"
+        else
+          fail "managed Mise $resource_desired is missing"
+        fi
+        ;;
+      homebrew-formula:*)
+        formula="${resource_id#homebrew-formula:}"; formula="${formula##*/}"
+        brew list --formula "$formula" >/dev/null 2>&1 && ok "$formula Homebrew formula is installed" || fail "$formula Homebrew formula is missing"
+        ;;
+      homebrew-cask:*)
+        cask="${resource_id#homebrew-cask:}"
+        brew list --cask "$cask" >/dev/null 2>&1 && ok "$cask application is installed" || fail "$cask application is missing"
+        ;;
+      mas:*)
+        mas_id="${resource_id#mas:}"
+        if mas list 2>/dev/null | awk '{print $1}' | grep -Fxq "$mas_id"; then
+          ok "App Store ID $mas_id is installed"
+        else
+          note "App Store ID $mas_id is pending; sign in to the App Store and rerun Safe sync"
+        fi
+        ;;
+      system-package:*)
+        system_package="${resource_id#system-package:}"
+        if [ "$STATE_DISTRO" = ubuntu ]; then
+          dpkg-query -W -f='${Status}' "$system_package" 2>/dev/null | grep -q 'ok installed' && ok "$system_package is installed" || fail "$system_package is missing"
+        elif [ "$STATE_DISTRO" = amzn ]; then
+          rpm -q "$system_package" >/dev/null 2>&1 && ok "$system_package is installed" || fail "$system_package is missing"
+        fi
+        ;;
+      mise-tool:*)
+        mise_tool="${resource_provider#mise:}"
+        if MISE_CONFIG_FILE="$MISE_CONFIG_FILE" mise where "$mise_tool@$resource_desired" >/dev/null 2>&1; then
+          ok "$mise_tool $resource_desired is installed"
+        else
+          fail "$mise_tool $resource_desired is missing"
+        fi
+        ;;
+      plugin:*)
+        plugin_name="${resource_id#plugin:}"
+        plugin_path="$(plugin_destination "$plugin_name" 2>/dev/null || true)"
+        if [ -n "$plugin_path" ] && [ -d "$plugin_path/.git" ] && \
+          [ "$(git -C "$plugin_path" rev-parse HEAD 2>/dev/null || true)" = "$resource_desired" ]; then
+          ok "$plugin_name is at its managed revision"
+        else
+          fail "$plugin_name is missing or differs from its managed revision"
+        fi
+        ;;
+      cli:eza)
+        eza --version 2>/dev/null | grep -q "v${resource_desired}" && ok "eza $resource_desired is installed" || fail "managed eza $resource_desired is missing"
+        ;;
+      cli:tldr)
+        tldr --version 2>/dev/null | grep -q "$resource_desired" && ok "tldr $resource_desired is installed" || fail "managed tldr $resource_desired is missing"
+        ;;
+    esac
+  done < "$VEDUP_RESOURCES_FILE"
+
+  if [ "$STATE_PLATFORM" = macos ] && [ "$STATE_APPLY_MACOS_DEFAULTS" = 1 ]; then
+    preference_args=(--check)
+    [ "$STATE_MINIMAL_DOCK" = 1 ] && preference_args+=(--minimal-dock)
+    [ "$STATE_KEYBOARD_SHORTCUTS" = 1 ] && preference_args+=(--keyboard-shortcuts)
+    [ "$STATE_EXPERIMENTAL_MACOS_DEFAULTS" = 1 ] && preference_args+=(--experimental)
+    if "$REPO_ROOT/dotfiles/macos/setup-commands.sh" "${preference_args[@]}" >/dev/null 2>&1; then
+      ok "tracked macOS preferences match"
+    else
+      fail "tracked macOS preferences still differ"
+    fi
+  fi
+fi
+
+if [ "$DOTFILES_ONLY" != 1 ] && command -v mise >/dev/null 2>&1; then
+  expected_version="$(plan_mise_version aqua:neovim/neovim)"
+  version="$(mise_exec_config "$MISE_CONFIG_FILE" nvim --version 2>/dev/null | \
+    awk 'NR == 1 { version=$2; sub(/^v/, "", version); print version; exit }')"
+  if [ -n "$expected_version" ] && [ "$version" = "$expected_version" ] && \
+      mise_exec_config "$MISE_CONFIG_FILE" nvim --headless \
+      "+lua if vim.version.lt(vim.version(), {0, 11, 2}) then vim.cmd('cquit') end" \
+      +qa </dev/null >/dev/null 2>&1; then
+    ok "Neovim $version and the managed configuration load"
+  else
+    fail "Pinned Neovim ${expected_version:-unknown} could not be selected and loaded (resolved ${version:-unknown})"
+  fi
+fi
+
+if [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
+  if zsh -n "$HOME/.zshrc" >/dev/null 2>&1; then ok "The managed Zsh entrypoint parses"
+  else fail "The managed Zsh entrypoint does not parse"; fi
+fi
+
+if [ "$QUICK" != 1 ] && [ "$DOTFILES_ONLY" != 1 ] && [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
+  zsh_plugin_root="${XDG_DATA_HOME:-$HOME/.local/share}/vedup/zsh/plugins"
+  zsh_cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/vedup/zsh"
+  plugin_failures=0
+  while IFS=: read -r plugin_name expected_commit; do
+    plugin_path="$zsh_plugin_root/$plugin_name"
+    plugin_owner="$(state_resource_owner "plugin:$plugin_name" 2>/dev/null || true)"
+    if [ "$plugin_owner" = external ] && [ -d "$plugin_path/.git" ]; then
+      ok "$plugin_name is compatible and externally owned"
+    elif [ -d "$plugin_path/.git" ] && [ "$(git -C "$plugin_path" rev-parse HEAD 2>/dev/null)" = "$expected_commit" ]; then
+      ok "$plugin_name is pinned"
+    else
+      fail "$plugin_name is missing or not at its pinned revision"
+      plugin_failures=$((plugin_failures + 1))
+    fi
+  done <<EOF
+zsh-autosuggestions:$ZSH_AUTOSUGGESTIONS_COMMIT
+zsh-syntax-highlighting:$ZSH_SYNTAX_HIGHLIGHTING_COMMIT
+zsh-history-substring-search:$ZSH_HISTORY_SUBSTRING_SEARCH_COMMIT
+zsh-completions:$ZSH_COMPLETIONS_COMMIT
+zsh-you-should-use:$ZSH_YOU_SHOULD_USE_COMMIT
+git-alias:$ZSH_GIT_ALIAS_COMMIT
+EOF
+
+  # shellcheck disable=SC2016
+  if [ "$plugin_failures" -eq 0 ] && env TERM=xterm-256color VEDUP_ZSH_PLUGIN_ROOT="$zsh_plugin_root" \
+    zsh -dfic 'source "$1"; (( $+functions[_zsh_autosuggest_start] && $+functions[_zsh_highlight] && $+widgets[history-substring-search-up] && $+aliases[ga] && $+functions[check_alias_usage] ))' \
+      _ "$HOME/.zshrc" >/dev/null 2>&1; then
+    ok "The complete Zsh configuration and interactive plugins load"
+  elif [ "$plugin_failures" -eq 0 ]; then
+    fail "Zsh plugins are installed but their interactive features do not load"
+  fi
+
+  if [ -r "$HOME/.zsh.d/completions.sh" ]; then
+    # shellcheck disable=SC2016
+    insecure_completion_dirs="$(env VEDUP_ZSH_PLUGIN_ROOT="$zsh_plugin_root" zsh -dfc \
+      'source "$1"; autoload -Uz compaudit; compaudit' _ "$HOME/.zsh.d/completions.sh" 2>/dev/null || true)"
+  else
+    insecure_completion_dirs="missing:$HOME/.zsh.d/completions.sh"
+  fi
+  managed_insecure_completion_dirs=""
+  external_insecure_completion_dirs=""
+  while IFS= read -r insecure_dir; do
+    [ -n "$insecure_dir" ] || continue
+    case "$insecure_dir" in
+      "$HOME"/*|"$zsh_plugin_root"/*)
+        managed_insecure_completion_dirs="${managed_insecure_completion_dirs}${managed_insecure_completion_dirs:+ }$insecure_dir"
+        ;;
+      *)
+        external_insecure_completion_dirs="${external_insecure_completion_dirs}${external_insecure_completion_dirs:+ }$insecure_dir"
+        ;;
+    esac
+  done <<< "$insecure_completion_dirs"
+  if [ -n "$managed_insecure_completion_dirs" ]; then
+    fail "Vedup-managed Zsh completion directories are insecure: $managed_insecure_completion_dirs"
+  elif [ -n "$external_insecure_completion_dirs" ]; then
+    note "External system completion directories failed compaudit and were left unchanged: $external_insecure_completion_dirs"
+  else
+    ok "Zsh completion directories pass the security audit"
+  fi
+
+  for integration_name in mise zoxide fzf carapace starship; do
+    integration_cache="$zsh_cache_root/init/$integration_name.zsh"
+    if command -v "$integration_name" >/dev/null 2>&1 && \
+      [ -s "$integration_cache" ] && zsh -n "$integration_cache" >/dev/null 2>&1; then
+      ok "$integration_name Zsh initialization is cached and valid"
+    elif command -v "$integration_name" >/dev/null 2>&1; then
+      fail "$integration_name Zsh initialization cache is missing or invalid"
+    fi
+  done
+fi
+
+if [ "$STATE_FOUND" = 1 ] && [ "$DOTFILES_ONLY" != 1 ]; then
+  if [ "$STATE_WITH_AWS" = 1 ]; then
+    if command -v aws >/dev/null 2>&1; then ok "optional AWS CLI is available"; else fail "optional AWS CLI is missing"; fi
+  fi
+  if [ "$STATE_WITH_DOCKER" = 1 ]; then
+    if command -v docker >/dev/null 2>&1; then ok "optional Docker CLI is available"; else fail "optional Docker CLI is missing"; fi
+    if command -v lazydocker >/dev/null 2>&1; then ok "optional lazydocker is available"; else fail "optional lazydocker is missing"; fi
+    if [ "$STATE_PLATFORM" = linux ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl is-active docker >/dev/null 2>&1 && ok "Docker service is active" || fail "Docker service is not active"
+      if [ "$(id -u)" -ne 0 ]; then
+        id -nG "$USER" | tr ' ' '\n' | grep -Fxq docker && ok "the selected user belongs to the Docker group" || fail "the selected user is not in the Docker group"
+      fi
+    fi
+  fi
+  if [ "$STATE_PLATFORM" = macos ] && choices_app_selected workstation formula FelixKratz/formulae/borders; then
+    if command -v borders >/dev/null 2>&1; then ok "macOS window borders are available"; else fail "macOS window borders are missing"; fi
+  fi
+  if [ "$STATE_CHANGE_SHELL" = 1 ]; then
+    expected_shell="$(command -v zsh 2>/dev/null || true)"
+    actual_shell="${SHELL:-}"
+    if [ "$STATE_PLATFORM" = linux ] && command -v getent >/dev/null 2>&1; then actual_shell="$(getent passwd "$USER" | awk -F: '{print $7}')"
+    elif [ "$STATE_PLATFORM" = macos ] && command -v dscl >/dev/null 2>&1; then actual_shell="$(dscl . -read "/Users/$USER" UserShell 2>/dev/null | awk '{print $2}')"; fi
+    [ -n "$expected_shell" ] && [ "$actual_shell" = "$expected_shell" ] && ok "Zsh is the account login shell" || fail "the account login shell is not Zsh"
+  fi
+fi
+
+if [ "$failures" -gt 0 ]; then
+  printf '[doctor] %d check(s) failed.\n' "$failures" >&2
+  exit 1
+fi
+printf '[doctor] All checks passed.\n'

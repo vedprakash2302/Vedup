@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/state.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/choices.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/apps.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/config.sh"
+
+state_load "$VEDUP_STATE_FILE" || die "Vedup has not completed a managed synchronization on this machine."
+choices_load_or_default || die "Saved application choices are invalid."
+PROFILE="$STATE_PROFILE" WITH_PERSONAL_APPS="$STATE_WITH_PERSONAL_APPS"
+read -r -a STOW_PACKAGES <<< "$STATE_STOW_PACKAGES"
+config_scan
+
+printf 'Vedup status\n\n'
+printf 'Release:       %s (%s)\n' "$STATE_RELEASE" "${STATE_COMMIT:0:12}"
+printf 'Updates:       https://github.com/%s\n' "$(vedup_repository)"
+current_pointer="${XDG_DATA_HOME:-$HOME/.local/share}/vedup/current"
+applied_pointer="${XDG_DATA_HOME:-$HOME/.local/share}/vedup/applied"
+if [ -L "$current_pointer" ] && [ -L "$applied_pointer" ] && \
+  [ "$(readlink "$current_pointer")" != "$(readlink "$applied_pointer")" ]; then
+  printf '%s\n' 'CLI update:    downloaded; run vedup sync when you want to apply its managed configuration'
+fi
+printf 'Profile:       %s\n' "$STATE_PROFILE"
+printf 'Configuration: '
+if [ "$CONFIG_CONFLICT_COUNT" -gt 0 ]; then
+  printf '%s incoming conflict(s); local files were preserved\n' "$CONFIG_CONFLICT_COUNT"
+elif [ "$CONFIG_NEEDS_UPDATE" = 1 ]; then
+  printf 'an incoming template update is available\n'
+else
+  local_change_count="$(config_capture_changes 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$local_change_count" -gt 0 ]; then printf '%s local change(s) available to save\n' "$local_change_count"
+  else printf 'synchronized\n'; fi
+fi
+
+if [ "$STATE_PLATFORM" = macos ]; then
+  missing=0
+  while IFS=$'\t' read -r scope provider identifier label description; do
+    case "$provider" in
+      formula) inventory_package_installed formula "${identifier##*/}" || { printf 'Missing app:    %s (%s)\n' "$label" "$identifier"; missing=$((missing + 1)); } ;;
+      cask) inventory_package_installed cask "${identifier##*/}" || { printf 'Missing app:    %s (%s)\n' "$label" "$identifier"; missing=$((missing + 1)); } ;;
+      mas) inventory_package_installed mas "$identifier" || { printf 'Pending store:  %s (App Store ID %s)\n' "$label" "$identifier"; missing=$((missing + 1)); } ;;
+    esac
+  done < <(apps_each_selected)
+  [ "$missing" -gt 0 ] || printf 'Applications:  synchronized\n'
+fi
+
+printf '\n%s\n' "Run \`vedup save\` to review local changes, or \`vedup sync\` to apply Vedup's setup."

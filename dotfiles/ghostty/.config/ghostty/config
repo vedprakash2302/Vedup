@@ -1,0 +1,55 @@
+# Typography
+font-family = "JetBrains Mono"
+font-size = 14
+font-thicken = true
+
+# Window
+window-width = 160
+window-height = 50
+window-padding-y = 5, 0
+window-padding-x = 10
+initial-window = true
+resize-overlay = never
+window-save-state = always
+window-step-resize = false
+confirm-close-surface = false
+
+# Appearance
+theme = GruvboxHard
+bold-is-bright = true
+# background-opacity-cells = true
+background-opacity = 0.80
+background-blur = true
+background-blur-radius = 40
+minimum-contrast = 1.1
+cursor-style = block
+adjust-cell-height = 10%
+adjust-cell-width = -5%
+adjust-cursor-height = -15%
+
+# Shortcuts
+keybind = global:cmd+option+grave_accent=toggle_quick_terminal
+keybind = cmd+comma=text:nvim ~/.config/ghostty/config\n
+
+# Session behavior
+auto-update = check
+auto-update-channel = stable
+quit-after-last-window-closed = true
+shell-integration = zsh
+shell-integration-features = no-cursor
+cursor-click-to-move = true
+command = /bin/zsh -c "~/.scripts/tmux-on-launch.sh"
+
+# macOS
+macos-option-as-alt = true
+macos-titlebar-style = hidden
+macos-shortcuts = allow
+macos-non-native-fullscreen = padded-notch
+
+# Clipboard
+copy-on-select = clipboard
+clipboard-trim-trailing-spaces = true
+
+# Quick terminal
+quick-terminal-position = right
+quick-terminal-autohide = false

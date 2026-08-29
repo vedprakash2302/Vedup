@@ -528,7 +528,7 @@ parallel_and_recovery() {
 }
 
 zsh_features() {
-  local test_home="$TEST_ROOT/zsh-features" plugin_root fake_bin output second_output headless_output generator_log zsh_version
+  local test_home="$TEST_ROOT/zsh-features" plugin_root fake_bin output second_output headless_output warm_output generator_log zsh_version
   plugin_root="$test_home/share/vedup/zsh/plugins"
   fake_bin="$test_home/bin"
   generator_log="$test_home/generators.log"
@@ -540,6 +540,7 @@ zsh_features() {
   for module in "$REPO_ROOT"/dotfiles/zsh/.zsh.d/*.sh; do
     ln -s "$module" "$test_home/.zsh.d/${module##*/}"
   done
+  ln -s "$REPO_ROOT/dotfiles/zsh/.zshrc" "$test_home/.zshrc"
   printf 'VEDUP_CUSTOM_MODULE=loaded\n' > "$test_home/.zsh.d/custom.sh"
   printf 'VEDUP_LOCAL_MODULE=loaded\n' > "$test_home/.zshrc.local"
   printf '#compdef vedup-test\n' > "$plugin_root/zsh-completions/src/_vedup-test"
@@ -578,6 +579,15 @@ zsh_features() {
   [ "$headless_output" = zsh-headless-ok ] || fail "headless interactive Zsh startup was not quiet: $headless_output"
   [ ! -e "$generator_log" ] || fail "headless interactive Zsh startup loaded terminal integrations"
 
+  warm_output="$(HOME="$test_home" XDG_DATA_HOME="$test_home/share" VEDUP_FAKE_GENERATOR_LOG="$generator_log" \
+    PATH="$fake_bin:/usr/bin:/bin" VEDUP_BENCH_REPO="$REPO_ROOT" bash -c '
+      set -Eeuo pipefail
+      setup_repo="$VEDUP_BENCH_REPO"; set --; source "$setup_repo/bin/setup"
+      DRY_RUN=0
+      warm_zsh_startup_cache
+    ' 2>&1)" || fail "Zsh cache warming failed: $warm_output"
+  [ -z "$warm_output" ] || fail "Zsh cache warming printed terminal noise: $warm_output"
+
   # shellcheck disable=SC2016
   output="$(HOME="$test_home" XDG_DATA_HOME="$test_home/share" VEDUP_FAKE_GENERATOR_LOG="$generator_log" \
     VEDUP_ZSH_FORCE_TERMINAL=1 \
@@ -609,6 +619,17 @@ zsh_features() {
     zsh -n "$test_home/.cache/vedup/zsh/init/$generator.zsh" || fail "$generator cache is invalid"
   done
   [ -s "$test_home/.cache/vedup/zsh/zcompdump-${zsh_version}" ] || fail "completion cache was not created"
+  printf '#!/usr/bin/env bash\nexit 7\n' > "$fake_bin/starship"
+  rm -f "$test_home/.cache/vedup/zsh/init/starship.zsh"
+  if HOME="$test_home" XDG_DATA_HOME="$test_home/share" VEDUP_FAKE_GENERATOR_LOG="$generator_log" \
+      PATH="$fake_bin:/usr/bin:/bin" VEDUP_BENCH_REPO="$REPO_ROOT" bash -c '
+        set -Eeuo pipefail
+        setup_repo="$VEDUP_BENCH_REPO"; set --; source "$setup_repo/bin/setup"
+        DRY_RUN=0
+        warm_zsh_startup_cache
+      ' >/dev/null 2>&1; then
+    fail "Zsh cache warming hid a failed integration generator"
+  fi
   pass "modular Zsh features and atomic warm-start caches"
 }
 
@@ -1021,6 +1042,7 @@ EOF
 
 release_failure_safety() {
   local fixture="$TEST_ROOT/release-failure" payload archive checksum rendered fake_bin output_home activation_release activation_current activation_applied
+  local inferred_home inferred_release inferred_current inferred_applied
   fixture="$TEST_ROOT/release-failure"
   payload="$fixture/payload/vedup-v9.9.9"
   archive="$fixture/incomplete.tar.gz"
@@ -1072,6 +1094,26 @@ EOF
   ' || fail "verified release activation failed"
   [ "$(readlink "$activation_current")" = "$activation_release" ] || fail "current was not atomically switched to the verified release"
   [ "$(readlink "$activation_applied")" = "$activation_release" ] || fail "applied policy was not switched with committed setup"
+
+  inferred_home="$fixture/inferred/home"
+  inferred_release="$inferred_home/.local/share/vedup/releases/v9.9.9-inferred"
+  inferred_current="$inferred_home/.local/share/vedup/current"
+  inferred_applied="$inferred_home/.local/share/vedup/applied"
+  mkdir -p "$inferred_home/.local/share/vedup/old" "$(dirname "$inferred_release")"
+  cp -R "$REPO_ROOT" "$inferred_release"
+  ln -s "$inferred_release" "$inferred_current"
+  ln -s "$inferred_home/.local/share/vedup/old" "$inferred_applied"
+  HOME="$inferred_home" VEDUP_INFERRED_RELEASE="$inferred_release" bash -c '
+    set -Eeuo pipefail
+    set --
+    source "$VEDUP_INFERRED_RELEASE/bin/setup"
+    [ "$VEDUP_PENDING_RELEASE" = "$VEDUP_INFERRED_RELEASE" ]
+    VEDUP_TRANSACTION_DIR="$HOME/.local/state/vedup/transactions/inferred"
+    mkdir -p "$VEDUP_TRANSACTION_DIR"
+    activate_pending_release
+  ' || fail "vedup sync did not infer the downloaded release after vedup update"
+  [ "$(readlink "$inferred_applied")" = "$inferred_release" ] || \
+    fail "inferred synchronization did not activate the downloaded release policy"
   pass "checksum-bound release extraction and failure-safe activation"
 }
 

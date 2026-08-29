@@ -4,8 +4,9 @@ typeset -g VEDUP_ZSH_MODULES="$HOME/.zsh.d"
 
 # Codex Remote and other automation may force an interactive login shell without
 # allocating a terminal. Do not load prompt, completion, color, or line-editor
-# integrations in that mode. Vedup's own tests and cache warmer opt in explicitly.
-if [[ -o interactive && "${VEDUP_ZSH_FORCE_TERMINAL:-0}" != 1 ]] && \
+# integrations in that mode. Tests may opt into the full terminal stack, while
+# the cache warmer loads only the cache-producing part of this file.
+if [[ -o interactive && "${VEDUP_ZSH_FORCE_TERMINAL:-0}" != 1 && "${VEDUP_ZSH_CACHE_WARM:-0}" != 1 ]] && \
     { [[ ! -t 0 || ! -t 1 ]] || [[ -z "${TERM:-}" || "${TERM:-dumb}" == dumb ]]; }; then
   unset VEDUP_ZSH_MODULES
   return 0
@@ -21,18 +22,38 @@ if [[ -o interactive ]]; then
 
   if (( $+functions[vedup_prepare_init_cache] )); then
     vedup_prepare_init_cache mise mise activate zsh
-    [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    if [[ "${VEDUP_ZSH_CACHE_WARM:-0}" == 1 ]]; then
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] || return 1
+    else
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    fi
     vedup_prepare_init_cache zoxide zoxide init zsh
-    [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    if [[ "${VEDUP_ZSH_CACHE_WARM:-0}" == 1 ]]; then
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] || return 1
+    else
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    fi
     vedup_prepare_init_cache fzf fzf --zsh
-    [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    if [[ "${VEDUP_ZSH_CACHE_WARM:-0}" == 1 ]]; then
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] || return 1
+    else
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    fi
     if (( $+commands[carapace] )); then
       export CARAPACE_BRIDGES='zsh'
       vedup_prepare_init_cache carapace carapace _carapace
-      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+      if [[ "${VEDUP_ZSH_CACHE_WARM:-0}" == 1 ]]; then
+        [[ -r "$VEDUP_INIT_CACHE_FILE" ]] || return 1
+      else
+        [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+      fi
     fi
     vedup_prepare_init_cache starship starship init zsh
-    [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    if [[ "${VEDUP_ZSH_CACHE_WARM:-0}" == 1 ]]; then
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] || return 1
+    else
+      [[ -r "$VEDUP_INIT_CACHE_FILE" ]] && source "$VEDUP_INIT_CACHE_FILE"
+    fi
   else
     # A partially linked configuration remains usable, although Vedup's normal
     # installation always provides the cache helper.
@@ -44,6 +65,11 @@ if [[ -o interactive ]]; then
       source <(carapace _carapace)
     fi
     (( $+commands[starship] )) && eval "$(starship init zsh)"
+  fi
+
+  if [[ "${VEDUP_ZSH_CACHE_WARM:-0}" == 1 ]]; then
+    unset VEDUP_INIT_CACHE_FILE VEDUP_ZSH_REFRESH_CACHE VEDUP_ZSH_CACHE_WARM VEDUP_ZSH_MODULES
+    return 0
   fi
 
   # Load every modular file, including user-added modules, while keeping the

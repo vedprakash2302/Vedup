@@ -119,7 +119,7 @@ state_validate_resources() {
   [ -r "$file" ] || return 1
   while IFS=$'\t' read -r action id provider owner current desired description; do
     [[ "$action" =~ ^(install|update|keep|configure|review|conflict)$ ]] || return 1
-    [[ "$id" =~ ^[A-Za-z0-9._:+/-]+$ && "$provider" =~ ^[A-Za-z0-9._:+/-]+$ ]] || return 1
+    [[ "$id" =~ ^[A-Za-z0-9._:@+/-]+$ && "$provider" =~ ^[A-Za-z0-9._:@+/-]+$ ]] || return 1
     [[ "$owner" =~ ^(vedup-managed|external|unmanaged-conflict)$ ]] || return 1
     [ -n "$current" ] && [ -n "$desired" ] && [ -n "$description" ] || return 1
     count=$((count + 1))

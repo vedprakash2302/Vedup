@@ -55,11 +55,11 @@ VEDUP_RELEASE_ROLLBACK_FILE=""
 # applied policy unchanged. A later sync runs from that downloaded release, so
 # infer the pending activation even when no bootstrap process supplied it.
 if [ -z "${VEDUP_PENDING_RELEASE:-}" ] && [ -L "$VEDUP_CURRENT_LINK" ]; then
-  vedup_repo_release="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd || true)"
-  vedup_running_release="$(cd -P "$VEDUP_CURRENT_LINK" 2>/dev/null && pwd || true)"
+  if ! vedup_repo_release="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd)"; then vedup_repo_release=""; fi
+  if ! vedup_running_release="$(cd -P "$VEDUP_CURRENT_LINK" 2>/dev/null && pwd)"; then vedup_running_release=""; fi
   vedup_applied_release=""
   if [ -L "$VEDUP_APPLIED_LINK" ]; then
-    vedup_applied_release="$(cd -P "$VEDUP_APPLIED_LINK" 2>/dev/null && pwd || true)"
+    if ! vedup_applied_release="$(cd -P "$VEDUP_APPLIED_LINK" 2>/dev/null && pwd)"; then vedup_applied_release=""; fi
   fi
   if [ "$vedup_running_release" = "$vedup_repo_release" ] && [ "$vedup_applied_release" != "$vedup_repo_release" ]; then
     VEDUP_PENDING_RELEASE="$REPO_ROOT"

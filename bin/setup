@@ -63,6 +63,22 @@ if [ -z "${VEDUP_PENDING_RELEASE:-}" ] && [ -L "$VEDUP_CURRENT_LINK" ]; then
   fi
   if [ "$vedup_running_release" = "$vedup_repo_release" ] && [ "$vedup_applied_release" != "$vedup_repo_release" ]; then
     VEDUP_PENDING_RELEASE="$REPO_ROOT"
+    if [ -f "$REPO_ROOT/.vedup-release" ]; then
+      vedup_release_ref=""
+      vedup_release_commit=""
+      while IFS='=' read -r vedup_metadata_key vedup_metadata_value; do
+        case "$vedup_metadata_key" in
+          release) vedup_release_ref="$vedup_metadata_value" ;;
+          commit) vedup_release_commit="$vedup_metadata_value" ;;
+        esac
+      done < "$REPO_ROOT/.vedup-release"
+      [[ "$vedup_release_ref" =~ ^v[0-9A-Za-z._+-]+$ ]] || die "The pending Vedup release has invalid version metadata."
+      [[ "$vedup_release_commit" =~ ^[0-9a-f]{40}$ ]] || die "The pending Vedup release has invalid commit metadata."
+      VEDUP_RELEASE_REF="$vedup_release_ref"
+      VEDUP_RELEASE_COMMIT="$vedup_release_commit"
+      export VEDUP_RELEASE_REF VEDUP_RELEASE_COMMIT
+      unset vedup_release_ref vedup_release_commit vedup_metadata_key vedup_metadata_value
+    fi
     export VEDUP_PENDING_RELEASE VEDUP_CURRENT_LINK VEDUP_APPLIED_LINK
   fi
   unset vedup_repo_release vedup_running_release vedup_applied_release

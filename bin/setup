@@ -48,7 +48,25 @@ KEYBOARD_SHORTCUTS_EXPLICIT=0
 EXPERIMENTAL_DEFAULTS_EXPLICIT=0
 SHELL_EXPLICIT=0
 VEDUP_APPLIED_LINK="${VEDUP_APPLIED_LINK:-${XDG_DATA_HOME:-$HOME/.local/share}/vedup/applied}"
+VEDUP_CURRENT_LINK="${VEDUP_CURRENT_LINK:-${XDG_DATA_HOME:-$HOME/.local/share}/vedup/current}"
 VEDUP_RELEASE_ROLLBACK_FILE=""
+
+# `vedup update` moves the CLI pointer first and deliberately leaves the
+# applied policy unchanged. A later sync runs from that downloaded release, so
+# infer the pending activation even when no bootstrap process supplied it.
+if [ -z "${VEDUP_PENDING_RELEASE:-}" ] && [ -L "$VEDUP_CURRENT_LINK" ]; then
+  vedup_repo_release="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd || true)"
+  vedup_running_release="$(cd -P "$VEDUP_CURRENT_LINK" 2>/dev/null && pwd || true)"
+  vedup_applied_release=""
+  if [ -L "$VEDUP_APPLIED_LINK" ]; then
+    vedup_applied_release="$(cd -P "$VEDUP_APPLIED_LINK" 2>/dev/null && pwd || true)"
+  fi
+  if [ "$vedup_running_release" = "$vedup_repo_release" ] && [ "$vedup_applied_release" != "$vedup_repo_release" ]; then
+    VEDUP_PENDING_RELEASE="$REPO_ROOT"
+    export VEDUP_PENDING_RELEASE VEDUP_CURRENT_LINK VEDUP_APPLIED_LINK
+  fi
+  unset vedup_repo_release vedup_running_release vedup_applied_release
+fi
 
 usage() {
   cat <<'EOF'
@@ -537,14 +555,22 @@ install_cursor_extensions() {
 }
 
 warm_zsh_startup_cache() {
+  local warm_output
   if [ "$DRY_RUN" = 1 ]; then
     printf '[dry-run] refresh Vedup Zsh startup cache\n'
     return 0
   fi
   # shellcheck disable=SC2016
-  env VEDUP_ZSH_REFRESH_CACHE=1 VEDUP_ZSH_FORCE_TERMINAL=1 VEDUP_APPLIED_RELEASE="$REPO_ROOT" \
-    TERM="${TERM:-xterm-256color}" \
-    zsh -dfic 'source "$1"' _ "$HOME/.zshrc" </dev/null >/dev/null
+  if ! warm_output="$(env VEDUP_ZSH_REFRESH_CACHE=1 VEDUP_ZSH_CACHE_WARM=1 \
+      VEDUP_APPLIED_RELEASE="$REPO_ROOT" TERM=xterm-256color \
+      zsh -dfic 'source "$1"' _ "$HOME/.zshrc" </dev/null 2>&1)"; then
+    [ -z "$warm_output" ] || printf '%s\n' "$warm_output" >&2
+    return 1
+  fi
+  if [ -n "$warm_output" ]; then
+    printf '%s\n' "$warm_output" >&2
+    return 1
+  fi
 }
 
 install_neovim_plugins() {

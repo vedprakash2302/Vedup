@@ -571,7 +571,7 @@ zsh_features() {
     "$fake_bin/starship" "$fake_bin/eza"
 
   headless_output="$(HOME="$test_home" XDG_DATA_HOME="$test_home/share" VEDUP_FAKE_GENERATOR_LOG="$generator_log" \
-    PATH="$fake_bin:/usr/bin:/bin" TERM= zsh -fic '
+    PATH="$fake_bin:/usr/bin:/bin" TERM='' zsh -fic '
       source "$1"
       print zsh-headless-ok
     ' _ "$REPO_ROOT/dotfiles/zsh/.zshrc" </dev/null 2>&1)"

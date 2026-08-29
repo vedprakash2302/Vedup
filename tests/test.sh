@@ -1101,6 +1101,11 @@ EOF
   inferred_applied="$inferred_home/.local/share/vedup/applied"
   mkdir -p "$inferred_home/.local/share/vedup/old" "$(dirname "$inferred_release")"
   cp -R "$REPO_ROOT" "$inferred_release"
+  cat > "$inferred_release/.vedup-release" <<'EOF'
+release=v9.9.9
+commit=9999999999999999999999999999999999999999
+archive_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+EOF
   ln -s "$inferred_release" "$inferred_current"
   ln -s "$inferred_home/.local/share/vedup/old" "$inferred_applied"
   HOME="$inferred_home" VEDUP_INFERRED_RELEASE="$inferred_release" bash -c '
@@ -1108,6 +1113,8 @@ EOF
     set --
     source "$VEDUP_INFERRED_RELEASE/bin/setup"
     [ "$VEDUP_PENDING_RELEASE" = "$VEDUP_INFERRED_RELEASE" ]
+    [ "$VEDUP_RELEASE_REF" = v9.9.9 ]
+    [ "$VEDUP_RELEASE_COMMIT" = 9999999999999999999999999999999999999999 ]
     VEDUP_TRANSACTION_DIR="$HOME/.local/state/vedup/transactions/inferred"
     mkdir -p "$VEDUP_TRANSACTION_DIR"
     activate_pending_release

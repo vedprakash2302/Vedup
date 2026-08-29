@@ -946,6 +946,7 @@ EOF
   mkdir -p "$interrupted_home/vedup"
   sed 's/^with_aws.*/with_aws\t0/' "$state_home/vedup/state.tsv" > "$interrupted_home/vedup/state.tsv"
   printf 'keep\tgit\tsystem\texternal\tinstalled\tcompatible\tRetain Git\n' > "$interrupted_home/vedup/resources.tsv"
+  printf 'keep\thomebrew-cask:t3-code@nightly\thomebrew\texternal\tinstalled\tretained\tRetain T3 Code Nightly\n' >> "$interrupted_home/vedup/resources.tsv"
   cp "$interrupted_home/vedup/resources.tsv" \
     "$interrupted_home/vedup/transactions/20260816T000000Z-1/candidate-resources.tsv"
   printf '2026-08-16T00:00:00Z\tfailed\tpackages\tinjected failure\n' > \

@@ -94,7 +94,7 @@ PY
   done
   pass "Zsh plugin pins"
 
-  grep -Fq '/vedup/current' "$REPO_ROOT/dotfiles/zsh/.zsh.d/env.sh" || \
+  grep -Fq '/vedup/current' "$REPO_ROOT/dotfiles/zsh/.zshenv" || \
     fail "Zsh does not use the active Vedup release"
 
   for checksum in "$GUM_SHA_LINUX_X64" "$GUM_SHA_LINUX_ARM64" \
@@ -528,7 +528,7 @@ parallel_and_recovery() {
 }
 
 zsh_features() {
-  local test_home="$TEST_ROOT/zsh-features" plugin_root fake_bin output second_output generator_log zsh_version
+  local test_home="$TEST_ROOT/zsh-features" plugin_root fake_bin output second_output headless_output generator_log zsh_version
   plugin_root="$test_home/share/vedup/zsh/plugins"
   fake_bin="$test_home/bin"
   generator_log="$test_home/generators.log"
@@ -570,8 +570,17 @@ zsh_features() {
   chmod +x "$fake_bin/fzf" "$fake_bin/carapace" "$fake_bin/mise" "$fake_bin/zoxide" \
     "$fake_bin/starship" "$fake_bin/eza"
 
+  headless_output="$(HOME="$test_home" XDG_DATA_HOME="$test_home/share" VEDUP_FAKE_GENERATOR_LOG="$generator_log" \
+    PATH="$fake_bin:/usr/bin:/bin" TERM='' zsh -fic '
+      source "$1"
+      print zsh-headless-ok
+    ' _ "$REPO_ROOT/dotfiles/zsh/.zshrc" </dev/null 2>&1)"
+  [ "$headless_output" = zsh-headless-ok ] || fail "headless interactive Zsh startup was not quiet: $headless_output"
+  [ ! -e "$generator_log" ] || fail "headless interactive Zsh startup loaded terminal integrations"
+
   # shellcheck disable=SC2016
   output="$(HOME="$test_home" XDG_DATA_HOME="$test_home/share" VEDUP_FAKE_GENERATOR_LOG="$generator_log" \
+    VEDUP_ZSH_FORCE_TERMINAL=1 \
     PATH="$fake_bin:/usr/bin:/bin" \
     TERM=xterm-256color zsh -fic '
       source "$1"
@@ -586,6 +595,7 @@ zsh_features() {
     ' _ "$REPO_ROOT/dotfiles/zsh/.zshrc" 2>&1)"
   [[ "$output" == *"zsh-features-ok"* ]] || fail "modular Zsh feature stack did not load: $output"
   second_output="$(HOME="$test_home" XDG_DATA_HOME="$test_home/share" VEDUP_FAKE_GENERATOR_LOG="$generator_log" \
+    VEDUP_ZSH_FORCE_TERMINAL=1 \
     PATH="$fake_bin:/usr/bin:/bin" TERM=xterm-256color zsh -fic '
       source "$1"
       [[ "$VEDUP_MISE_LOADED" = 1 && "$VEDUP_ZOXIDE_LOADED" = 1 && "$VEDUP_FZF_LOADED" = 1 ]]

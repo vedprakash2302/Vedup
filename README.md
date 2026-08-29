@@ -44,7 +44,8 @@ system preferences. `vedup sync` is always a separate action.
 The terminal profile includes Zsh, tmux, Neovim, Starship, Mise-managed Node
 and Python, GitHub CLI, lazygit, modern search/file tools, completions,
 autosuggestions, syntax highlighting, history search, Git aliases, and pinned
-Zsh/tmux plugins.
+Zsh/tmux plugins. Quiet environment setup lives in `.zshenv`; prompt and
+line-editor features load only when Zsh has a real terminal.
 
 The macOS workstation bundle is declared once in
 [profiles/macos/apps.tsv](profiles/macos/apps.tsv). It includes Ghostty, Zed,

@@ -203,6 +203,12 @@ if [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
   else fail "The managed Zsh entrypoint does not parse"; fi
 fi
 
+if [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
+  headless_zsh_output="$(TERM='' zsh -dfic 'source "$1"' _ "$HOME/.zshrc" </dev/null 2>&1)" || true
+  if [ -z "$headless_zsh_output" ]; then ok "Headless interactive Zsh startup stays quiet"
+  else fail "Headless interactive Zsh startup produced terminal output"; fi
+fi
+
 if [ "$QUICK" != 1 ] && [ "$DOTFILES_ONLY" != 1 ] && [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
   zsh_plugin_root="${XDG_DATA_HOME:-$HOME/.local/share}/vedup/zsh/plugins"
   zsh_cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/vedup/zsh"
@@ -228,7 +234,7 @@ git-alias:$ZSH_GIT_ALIAS_COMMIT
 EOF
 
   # shellcheck disable=SC2016
-  if [ "$plugin_failures" -eq 0 ] && env TERM=xterm-256color VEDUP_ZSH_PLUGIN_ROOT="$zsh_plugin_root" \
+  if [ "$plugin_failures" -eq 0 ] && env TERM=xterm-256color VEDUP_ZSH_FORCE_TERMINAL=1 VEDUP_ZSH_PLUGIN_ROOT="$zsh_plugin_root" \
     zsh -dfic 'source "$1"; (( $+functions[_zsh_autosuggest_start] && $+functions[_zsh_highlight] && $+widgets[history-substring-search-up] && $+aliases[ga] && $+functions[check_alias_usage] ))' \
       _ "$HOME/.zshrc" >/dev/null 2>&1; then
     ok "The complete Zsh configuration and interactive plugins load"

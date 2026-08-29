@@ -2,7 +2,16 @@
 # startup is deliberately offline: installation and updates happen via `vedup`.
 typeset -g VEDUP_ZSH_MODULES="$HOME/.zsh.d"
 
-# Environment and completion paths must exist before command initialization.
+# Codex Remote and other automation may force an interactive login shell without
+# allocating a terminal. Do not load prompt, completion, color, or line-editor
+# integrations in that mode. Vedup's own tests and cache warmer opt in explicitly.
+if [[ -o interactive && "${VEDUP_ZSH_FORCE_TERMINAL:-0}" != 1 ]] && \
+    { [[ ! -t 0 || ! -t 1 ]] || [[ -z "${TERM:-}" || "${TERM:-dumb}" == dumb ]]; }; then
+  unset VEDUP_ZSH_MODULES
+  return 0
+fi
+
+# Terminal environment and completion paths must exist before initialization.
 [[ -r "$VEDUP_ZSH_MODULES/env.sh" ]] && source "$VEDUP_ZSH_MODULES/env.sh"
 [[ -r "$VEDUP_ZSH_MODULES/completions.sh" ]] && source "$VEDUP_ZSH_MODULES/completions.sh"
 [[ -r "$VEDUP_ZSH_MODULES/init-cache.sh" ]] && source "$VEDUP_ZSH_MODULES/init-cache.sh"

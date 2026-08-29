@@ -542,7 +542,7 @@ warm_zsh_startup_cache() {
     return 0
   fi
   # shellcheck disable=SC2016
-  env VEDUP_ZSH_REFRESH_CACHE=1 VEDUP_APPLIED_RELEASE="$REPO_ROOT" \
+  env VEDUP_ZSH_REFRESH_CACHE=1 VEDUP_ZSH_FORCE_TERMINAL=1 VEDUP_APPLIED_RELEASE="$REPO_ROOT" \
     TERM="${TERM:-xterm-256color}" \
     zsh -dfic 'source "$1"' _ "$HOME/.zshrc" </dev/null >/dev/null
 }

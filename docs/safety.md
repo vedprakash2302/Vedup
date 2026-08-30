@@ -14,6 +14,11 @@ link selects the CLI and may advance during `vedup update`; `applied` selects
 the machine policy and advances with committed state only after configuration
 and health checks pass. Both pointers roll back together if sync fails.
 
+Normal sync checks for a Vedup release update at most once every 12 hours. It
+uses a verified immutable archive and short timeouts. Network failure falls
+back to the installed release. `vedup sync --no-update` and `--offline` skip
+this release check. Other missing tools may still require network access.
+
 Managed configuration uses a writable three-way workspace:
 
 ```text

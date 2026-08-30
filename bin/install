@@ -491,7 +491,7 @@ run_home() {
   options+=("Diagnose a problem"); [ "$OS" != macos ] || options+=("Advanced"); options+=("Exit")
   ui_title "What would you like to do?"; ui_choose "Vedup" "${options[@]}"
   case "$UI_RESULT" in
-    Sync*) run_sync_flow 0 ;; Customize*) run_sync_flow 1 ;;
+    Sync*) cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/sync" ;; Customize*) run_sync_flow 1 ;;
     Save*) cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/capture" ;;
     "Update Vedup") cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/update" ;;
     "Update applications") run_app_updates ;; Diagnose*) cleanup_ui; UI_TEMP_DIR=""; exec "$REPO_ROOT/bin/doctor" ;;

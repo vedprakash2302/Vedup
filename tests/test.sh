@@ -767,6 +767,9 @@ EOF
     VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_UPDATE_CHECK_NOW=1001 \
     "$REPO_ROOT/bin/sync" --non-interactive >/dev/null 2>&1 || fail "cached normal sync failed"
   [ "$(wc -l < "$sync_curl_log" | tr -d ' ')" = "$curl_count" ] || fail "cached sync repeated the release check"
+  HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_UPDATE_CHECK_NOW=1002 \
+    "$REPO_ROOT/bin/sync" >/dev/null 2>&1 || fail "zero-argument non-terminal sync failed"
   output="$(HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
     VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_TEST_CURL_FAIL=1 \
     VEDUP_UPDATE_CHECK_TTL_SECONDS=0 VEDUP_UPDATE_CHECK_NOW=2000 \

@@ -743,6 +743,7 @@ EOF
   [[ "$output" == *"invalid release tag"* ]] || fail "vedup update rejection was not actionable"
   mkdir -p "$sync_home/.local/share/vedup/old-release/bin"
   for tool in setup install; do
+    # shellcheck disable=SC2016
     printf '#!/usr/bin/env bash\nprintf "sync-ran\\n" > "$HOME/setup-ran"\n' > \
       "$sync_home/.local/share/vedup/old-release/bin/$tool"
     chmod +x "$sync_home/.local/share/vedup/old-release/bin/$tool"

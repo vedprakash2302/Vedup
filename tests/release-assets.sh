@@ -12,6 +12,7 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 tar -tzf "$ARCHIVE" | grep '/bin/setup$' >/dev/null
 tar -tzf "$ARCHIVE" | grep '/bin/doctor$' >/dev/null
 tar -tzf "$ARCHIVE" | grep '/bin/update$' >/dev/null
+tar -tzf "$ARCHIVE" | grep '/bin/sync$' >/dev/null
 tar -tzf "$ARCHIVE" | grep '/bin/vedup$' >/dev/null
 tar -tzf "$ARCHIVE" | grep '/.vedup-manifest.sha256$' >/dev/null
 tar -tzf "$ARCHIVE" | grep '/repository.env$' >/dev/null
@@ -26,6 +27,7 @@ tar -xzf "$ARCHIVE" -C "$TEST_ROOT"
 test -x "$TEST_ROOT"/*/bin/setup
 test -x "$TEST_ROOT"/*/bin/doctor
 test -x "$TEST_ROOT"/*/bin/update
+test -x "$TEST_ROOT"/*/bin/sync
 test -x "$TEST_ROOT"/*/bin/vedup
 test -r "$TEST_ROOT"/*/repository.env
 grep -Fxq 'VEDUP_DEFAULT_REPOSITORY="vedprakash2302/Vedup"' "$TEST_ROOT"/*/repository.env

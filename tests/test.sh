@@ -652,11 +652,13 @@ vedup_self_update() {
   local bootstrap_fixture="$TEST_ROOT/self-update/bootstrap" invalid_fixture="$TEST_ROOT/self-update/invalid"
   local archive="$TEST_ROOT/self-update/vedup-v9.9.9.tar.gz" archive_sha output tool
   local symlink_launcher_home="$TEST_ROOT/self-update/symlink-launcher-home" preserved_before preserved_after
+  local sync_home="$TEST_ROOT/self-update/sync-home" sync_curl_log="$TEST_ROOT/self-update/sync-curl.log" curl_count
+  local rollback_sync_home="$TEST_ROOT/self-update/rollback-sync-home"
   mkdir -p "$fake_bin" "$update_home" "$update_root/payload/vedup-v9.9.9/bin"
   cp "$REPO_ROOT/repository.env" "$update_root/payload/vedup-v9.9.9/repository.env"
-  for tool in install setup update doctor; do
+  for tool in install setup update doctor sync; do
     # shellcheck disable=SC2016
-    printf '#!/usr/bin/env bash\nprintf "unexpected setup execution\\n" > "$HOME/setup-ran"\n' > "$update_root/payload/vedup-v9.9.9/bin/$tool"
+    printf '#!/usr/bin/env bash\nprintf "unexpected setup execution\\n" > "$HOME/setup-ran"\n[ "${VEDUP_TEST_SETUP_FAIL:-0}" != 1 ]\n' > "$update_root/payload/vedup-v9.9.9/bin/$tool"
     chmod +x "$update_root/payload/vedup-v9.9.9/bin/$tool"
   done
   printf '#!/usr/bin/env bash\nexit 0\n' > "$update_root/payload/vedup-v9.9.9/bin/vedup"
@@ -673,6 +675,8 @@ vedup_self_update() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 output=""
+if [ -n "${VEDUP_TEST_CURL_LOG:-}" ]; then printf 'curl\n' >> "$VEDUP_TEST_CURL_LOG"; fi
+if [ "${VEDUP_TEST_CURL_FAIL:-0}" = 1 ]; then exit 22; fi
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --output ]; then output="$2"; shift 2; else shift; fi
 done
@@ -737,13 +741,73 @@ EOF
     fail "vedup update accepted invalid release metadata"
   fi
   [[ "$output" == *"invalid release tag"* ]] || fail "vedup update rejection was not actionable"
+  mkdir -p "$sync_home/.local/share/vedup/old-release/bin"
+  for tool in setup install; do
+    # shellcheck disable=SC2016
+    printf '#!/usr/bin/env bash\nprintf "sync-ran\\n" > "$HOME/setup-ran"\n' > \
+      "$sync_home/.local/share/vedup/old-release/bin/$tool"
+    chmod +x "$sync_home/.local/share/vedup/old-release/bin/$tool"
+  done
+  ln -s "$sync_home/.local/share/vedup/old-release" "$sync_home/.local/share/vedup/current"
+  ln -s "$sync_home/.local/share/vedup/old-release" "$sync_home/.local/share/vedup/applied"
+  output="$(HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" "$REPO_ROOT/bin/update" --check-only 2>&1)"
+  [[ "$output" == *"Vedup update available: v9.9.9"* ]] || fail "release check did not report the available update"
+  [ ! -e "$sync_home/.local/share/vedup/releases/v9.9.9-000000000000" ] || \
+    fail "release check downloaded an update"
+  output="$(HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_UPDATE_CHECK_NOW=1000 \
+    "$REPO_ROOT/bin/sync" --non-interactive 2>&1)"
+  [[ "$output" == *"Vedup updated to v9.9.9"* ]] || fail "normal sync did not install the available Vedup update"
+  [ -f "$sync_home/setup-ran" ] || fail "normal sync did not continue with the downloaded release"
+  [ "$(cat "$sync_home/.cache/vedup/update-check")" = 1000 ] || fail "successful sync did not cache the update check"
+  curl_count="$(wc -l < "$sync_curl_log" | tr -d ' ')"
+  rm -f "$sync_home/setup-ran"
+  HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_UPDATE_CHECK_NOW=1001 \
+    "$REPO_ROOT/bin/sync" --non-interactive >/dev/null 2>&1 || fail "cached normal sync failed"
+  [ "$(wc -l < "$sync_curl_log" | tr -d ' ')" = "$curl_count" ] || fail "cached sync repeated the release check"
+  output="$(HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_TEST_CURL_FAIL=1 \
+    VEDUP_UPDATE_CHECK_TTL_SECONDS=0 VEDUP_UPDATE_CHECK_NOW=2000 \
+    "$REPO_ROOT/bin/sync" --non-interactive 2>&1)"
+  [[ "$output" == *"Continuing with the installed Vedup release"* ]] || \
+    fail "normal sync did not explain its update-check fallback"
+  [ -f "$sync_home/setup-ran" ] || fail "failed release check blocked synchronization with the installed release"
+  curl_count="$(wc -l < "$sync_curl_log" | tr -d ' ')"
+  HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_UPDATE_CHECK_TTL_SECONDS=0 \
+    "$REPO_ROOT/bin/sync" --no-update --non-interactive >/dev/null 2>&1 || fail "--no-update sync failed"
+  [ "$(wc -l < "$sync_curl_log" | tr -d ' ')" = "$curl_count" ] || fail "--no-update contacted the release endpoint"
+  output="$(HOME="$sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_CURL_LOG="$sync_curl_log" VEDUP_UPDATE_CHECK_TTL_SECONDS=0 \
+    "$REPO_ROOT/bin/sync" --dry-run --non-interactive 2>&1)"
+  [[ "$output" == *"dry-run uses the installed release"* ]] || fail "dry-run did not explain its update behavior"
+  [ "$(wc -l < "$sync_curl_log" | tr -d ' ')" = "$curl_count" ] || fail "dry-run contacted the release endpoint"
+  mkdir -p "$rollback_sync_home/.local/share/vedup/old-release/bin"
+  for tool in setup install; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$rollback_sync_home/.local/share/vedup/old-release/bin/$tool"
+    chmod +x "$rollback_sync_home/.local/share/vedup/old-release/bin/$tool"
+  done
+  ln -s "$rollback_sync_home/.local/share/vedup/old-release" "$rollback_sync_home/.local/share/vedup/current"
+  ln -s "$rollback_sync_home/.local/share/vedup/old-release" "$rollback_sync_home/.local/share/vedup/applied"
+  if HOME="$rollback_sync_home" PATH="$fake_bin:/usr/bin:/bin" VEDUP_TEST_BOOTSTRAP="$bootstrap_fixture" \
+    VEDUP_TEST_ARCHIVE="$archive" VEDUP_TEST_SETUP_FAIL=1 VEDUP_UPDATE_CHECK_NOW=3000 \
+    "$REPO_ROOT/bin/sync" --non-interactive >/dev/null 2>&1; then
+    fail "normal sync hid a failure in the downloaded release"
+  fi
+  [ "$(readlink "$rollback_sync_home/.local/share/vedup/current")" = \
+    "$rollback_sync_home/.local/share/vedup/old-release" ] || fail "failed automatic sync did not restore the previous CLI release"
+  [ "$(readlink "$rollback_sync_home/.local/share/vedup/applied")" = \
+    "$rollback_sync_home/.local/share/vedup/old-release" ] || fail "failed automatic sync changed the applied release"
   output="$("$REPO_ROOT/bin/vedup" help)"
-  [[ "$output" == *'update       Download, verify'* ]] || fail "vedup update is absent from command help"
+  [[ "$output" == *'sync         Update Vedup when due'* ]] || fail "automatic sync update is absent from command help"
+  [[ "$output" == *'update       Download, verify'* ]] || fail "download-only update is absent from command help"
   mkdir -p "$symlink_launcher_home/.local/bin"
   ln -s "$REPO_ROOT/bin/vedup" "$symlink_launcher_home/.local/bin/vedup"
   output="$(HOME="$symlink_launcher_home" "$symlink_launcher_home/.local/bin/vedup" help)"
   [[ "$output" == *'Usage: vedup'* ]] || fail "older symlink launcher derived the wrong repository root"
-  pass "self-update-only verification and atomic activation"
+  pass "explicit and automatic self-update verification, caching, fallback, and activation"
 }
 
 safe_sync_invariants() {

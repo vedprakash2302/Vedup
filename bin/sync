@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/lib/common.sh"
+
+UPDATE_MODE=auto
+CHECK_ONLY=0
+DRY_RUN_REQUESTED=0
+SYNC_ARGS=()
+VEDUP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vedup"
+VEDUP_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/vedup"
+UPDATE_CHECK_FILE="$VEDUP_CACHE_HOME/update-check"
+UPDATE_CHECK_TTL_SECONDS="${VEDUP_UPDATE_CHECK_TTL_SECONDS:-43200}"
+ORIGINAL_CURRENT_TARGET="$(readlink "$VEDUP_DATA_HOME/current" 2>/dev/null || true)"
+AUTOMATIC_UPDATE_ACTIVATED=0
+
+usage() {
+  cat <<'EOF'
+Usage: vedup sync [update options] [setup options]
+
+  --no-update    Skip the automatic Vedup release check
+  --offline      Skip the release check; other missing tools may still need network access
+  --check-only   Check for a Vedup release update, then exit
+
+All other options are passed to the friendly installer or automation engine.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --no-update) UPDATE_MODE=skip ;;
+    --offline) UPDATE_MODE=skip ;;
+    --check-only) CHECK_ONLY=1 ;;
+    --dry-run) DRY_RUN_REQUESTED=1; SYNC_ARGS+=("$1") ;;
+    -h|--help) usage; exit 0 ;;
+    *) SYNC_ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+if [ "$CHECK_ONLY" = 1 ] && [ "$UPDATE_MODE" = skip ]; then
+  die "--check-only cannot be combined with --no-update or --offline."
+fi
+case "$UPDATE_CHECK_TTL_SECONDS" in ''|*[!0-9]*) die "VEDUP_UPDATE_CHECK_TTL_SECONDS must be a non-negative number." ;; esac
+
+update_check_due() {
+  local now last
+  now="${VEDUP_UPDATE_CHECK_NOW:-$(date +%s)}"
+  case "$now" in ''|*[!0-9]*) return 0 ;; esac
+  [ -r "$UPDATE_CHECK_FILE" ] || return 0
+  IFS= read -r last < "$UPDATE_CHECK_FILE" || return 0
+  case "$last" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$now" -lt "$last" ] || [ $((now - last)) -ge "$UPDATE_CHECK_TTL_SECONDS" ]
+}
+
+record_update_check() {
+  local now temporary
+  now="${VEDUP_UPDATE_CHECK_NOW:-$(date +%s)}"
+  case "$now" in ''|*[!0-9]*) return 0 ;; esac
+  mkdir -p "$VEDUP_CACHE_HOME"
+  temporary="$UPDATE_CHECK_FILE.new.$$"
+  printf '%s\n' "$now" > "$temporary"
+  mv "$temporary" "$UPDATE_CHECK_FILE"
+}
+
+check_for_update() {
+  local output
+  if output="$(VEDUP_UPDATE_CONTINUE_SYNC=1 \
+      VEDUP_UPDATE_CONNECT_TIMEOUT="${VEDUP_UPDATE_CONNECT_TIMEOUT:-3}" \
+      VEDUP_UPDATE_MAX_TIME="${VEDUP_UPDATE_MAX_TIME:-15}" \
+      VEDUP_UPDATE_RETRY="${VEDUP_UPDATE_RETRY:-1}" \
+      "$REPO_ROOT/bin/update" "$@" 2>&1)"; then
+    [ -z "$output" ] || printf '%s\n' "$output"
+    record_update_check
+    return 0
+  fi
+  [ -z "$output" ] || printf '%s\n' "$output" >&2
+  return 1
+}
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  check_for_update --check-only || die "Could not check for a Vedup update."
+  exit 0
+fi
+
+if [ "$DRY_RUN_REQUESTED" = 1 ]; then
+  printf 'Vedup: dry-run uses the installed release and skips the automatic update.\n'
+elif [ "$UPDATE_MODE" = auto ] && update_check_due; then
+  if ! check_for_update; then
+    warn "The update check failed. Continuing with the installed Vedup release."
+  elif [ "$(readlink "$VEDUP_DATA_HOME/current" 2>/dev/null || true)" != "$ORIGINAL_CURRENT_TARGET" ]; then
+    AUTOMATIC_UPDATE_ACTIVATED=1
+  fi
+fi
+
+EXECUTION_ROOT="$REPO_ROOT"
+if [ -L "$VEDUP_DATA_HOME/current" ]; then
+  if current_root="$(cd -P "$VEDUP_DATA_HOME/current" 2>/dev/null && pwd)" && \
+    [ -x "$current_root/bin/setup" ] && [ -x "$current_root/bin/install" ]; then
+    EXECUTION_ROOT="$current_root"
+  fi
+fi
+
+set +e
+if [ "${#SYNC_ARGS[@]}" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  "$EXECUTION_ROOT/bin/install"
+  sync_status="$?"
+else
+  "$EXECUTION_ROOT/bin/setup" "${SYNC_ARGS[@]}"
+  sync_status="$?"
+fi
+set -e
+
+if [ "$sync_status" -ne 0 ] && [ "$AUTOMATIC_UPDATE_ACTIVATED" = 1 ]; then
+  current_link="$VEDUP_DATA_HOME/current"
+  temporary_link="$current_link.new.$$"
+  if [ -n "$ORIGINAL_CURRENT_TARGET" ]; then
+    ln -s "$ORIGINAL_CURRENT_TARGET" "$temporary_link"
+    if mv -Tf "$temporary_link" "$current_link" 2>/dev/null; then :
+    elif mv -fh "$temporary_link" "$current_link" 2>/dev/null; then :
+    else rm -f "$temporary_link"; warn "Could not restore the previous Vedup CLI pointer."; fi
+  else
+    rm -f "$current_link"
+  fi
+  warn "Synchronization failed. Restored the previously active Vedup CLI release."
+fi
+exit "$sync_status"

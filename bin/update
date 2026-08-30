@@ -15,6 +15,18 @@ VEDUP_APPLIED_LINK="$VEDUP_DATA_HOME/applied"
 UPDATE_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/vedup-update.XXXXXX")"
 DRY_RUN=0
 SETUP_SUCCESS=0
+CHECK_ONLY=0
+UPDATE_CONNECT_TIMEOUT="${VEDUP_UPDATE_CONNECT_TIMEOUT:-10}"
+UPDATE_MAX_TIME="${VEDUP_UPDATE_MAX_TIME:-120}"
+UPDATE_RETRY="${VEDUP_UPDATE_RETRY:-3}"
+
+usage() {
+  cat <<'EOF'
+Usage: vedup update [--check-only]
+
+  --check-only   Check whether a newer release is available without downloading it
+EOF
+}
 
 update_cleanup() {
   local exit_code="$?"
@@ -26,6 +38,22 @@ trap update_cleanup EXIT
 trap 'exit 130' INT TERM
 
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check-only) CHECK_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown update option: $1" ;;
+  esac
+  shift
+done
+for timeout_value in "$UPDATE_CONNECT_TIMEOUT" "$UPDATE_MAX_TIME" "$UPDATE_RETRY"; do
+  case "$timeout_value" in ''|*[!0-9]*) die "Update timeout and retry values must be non-negative numbers." ;; esac
+done
+CURL_ARGS=(--fail --silent --show-error --location --retry "$UPDATE_RETRY" --retry-delay 1 \
+  --retry-max-time "$UPDATE_MAX_TIME" --connect-timeout "$UPDATE_CONNECT_TIMEOUT" --max-time "$UPDATE_MAX_TIME" \
+  --proto '=https' --tlsv1.2)
+
 checksum_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
@@ -41,7 +69,7 @@ metadata_value() {
 release_is_valid() {
   [ -x "$release_dir/bin/vedup" ] && [ -x "$release_dir/bin/install" ] && \
     [ -x "$release_dir/bin/setup" ] && [ -x "$release_dir/bin/doctor" ] && \
-    [ -x "$release_dir/bin/update" ] && [ -r "$release_dir/.vedup-release" ] && \
+    [ -x "$release_dir/bin/update" ] && [ -x "$release_dir/bin/sync" ] && [ -r "$release_dir/.vedup-release" ] && \
     [ -r "$release_dir/.vedup-manifest.sha256" ] && [ -r "$release_dir/repository.env" ] || return 1
   grep -Fxq "release=$release_ref" "$release_dir/.vedup-release" && \
     grep -Fxq "commit=$release_commit" "$release_dir/.vedup-release" && \
@@ -72,7 +100,7 @@ payload_links_are_safe() {
   done < <(find "$root" -type l -print)
 }
 
-for command_name in curl tar find; do command -v "$command_name" >/dev/null 2>&1 || die "$command_name is required."; done
+command -v curl >/dev/null 2>&1 || die "curl is required."
 mkdir -p "$VEDUP_RELEASES_DIR"
 setup_lock_acquire
 trap update_cleanup EXIT
@@ -80,8 +108,7 @@ trap 'exit 130' INT TERM
 
 printf 'Checking for a Vedup update…\n'
 bootstrap="$UPDATE_TEMP/bootstrap"
-curl --fail --silent --show-error --location --retry 3 --retry-delay 1 \
-  --proto '=https' --tlsv1.2 "$BOOTSTRAP_URL" --output "$bootstrap"
+curl "${CURL_ARGS[@]}" "$BOOTSTRAP_URL" --output "$bootstrap"
 
 release_ref="$(metadata_value VEDUP_RELEASE_REF "$bootstrap" || true)"
 release_commit="$(metadata_value VEDUP_RELEASE_COMMIT "$bootstrap" || true)"
@@ -98,6 +125,13 @@ if [ "$current_target" = "$release_dir" ] && release_is_valid; then
   exit 0
 fi
 
+if [ "$CHECK_ONLY" = 1 ]; then
+  printf 'Vedup update available: %s\n' "$release_ref"
+  exit 0
+fi
+
+for command_name in tar find; do command -v "$command_name" >/dev/null 2>&1 || die "$command_name is required."; done
+
 if [ -e "$release_dir" ] && ! release_is_valid; then
   die "The release directory exists but failed validation: $release_dir"
 fi
@@ -106,8 +140,7 @@ if ! release_is_valid; then
   archive_name="vedup-${release_ref}.tar.gz"
   archive="$UPDATE_TEMP/$archive_name"
   archive_url="${BOOTSTRAP_URL%/releases/latest/download/bootstrap}/releases/download/${release_ref}/${archive_name}"
-  curl --fail --silent --show-error --location --retry 3 --retry-delay 1 \
-    --proto '=https' --tlsv1.2 "$archive_url" --output "$archive"
+  curl "${CURL_ARGS[@]}" "$archive_url" --output "$archive"
   [ "$(checksum_file "$archive")" = "$archive_sha256" ] || die "The update archive checksum did not match. Nothing was changed."
   archive_layout_is_safe "$archive" || die "The verified update archive has an unsafe layout. Nothing was changed."
 
@@ -118,7 +151,7 @@ if ! release_is_valid; then
   [ -d "$payload" ] || payload="$extract_root"
   if [ ! -x "$payload/bin/vedup" ] || [ ! -x "$payload/bin/install" ] || \
     [ ! -x "$payload/bin/setup" ] || [ ! -x "$payload/bin/doctor" ] || \
-    [ ! -x "$payload/bin/update" ] || [ ! -r "$payload/.vedup-manifest.sha256" ] || \
+    [ ! -x "$payload/bin/update" ] || [ ! -x "$payload/bin/sync" ] || [ ! -r "$payload/.vedup-manifest.sha256" ] || \
     [ ! -r "$payload/repository.env" ] || \
     ! payload_links_are_safe "$payload" || \
     ! (cd "$payload" && checksum_verify_manifest .vedup-manifest.sha256); then
@@ -162,9 +195,24 @@ else
   die "The update was verified but could not be activated. The previous Vedup remains active."
 fi
 
-"$command_link" help >/dev/null || die "The new Vedup command failed its activation check."
+if ! "$command_link" help >/dev/null; then
+  if [ -n "$current_target" ]; then
+    rollback_link="$VEDUP_CURRENT_LINK.rollback.$$"
+    ln -s "$current_target" "$rollback_link"
+    if mv -Tf "$rollback_link" "$VEDUP_CURRENT_LINK" 2>/dev/null; then :
+    elif mv -fh "$rollback_link" "$VEDUP_CURRENT_LINK" 2>/dev/null; then :
+    else rm -f "$rollback_link"; die "The new Vedup command failed and the previous CLI pointer could not be restored."; fi
+  else
+    rm -f "$VEDUP_CURRENT_LINK"
+  fi
+  die "The new Vedup command failed its activation check. The previous Vedup remains active."
+fi
 SETUP_SUCCESS=1
 
 printf '✓ Vedup updated to %s.\n' "$release_ref"
 printf '  Update repository: https://github.com/%s\n' "$UPDATE_REPOSITORY"
-printf '  Machine tools and settings were not changed. Run vedup sync when you want to apply setup updates.\n'
+if [ "${VEDUP_UPDATE_CONTINUE_SYNC:-0}" = 1 ]; then
+  printf '  Verified update installed. Continuing synchronization with this release.\n'
+else
+  printf '  Machine tools and settings were not changed. Run vedup sync when you want to apply setup updates.\n'
+fi

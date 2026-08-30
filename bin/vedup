@@ -20,8 +20,7 @@ command_name="$1"
 shift
 case "$command_name" in
   sync|install)
-    if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then exec "$REPO_ROOT/bin/install"
-    else exec "$REPO_ROOT/bin/setup" "$@"; fi
+    exec "$REPO_ROOT/bin/sync" "$@"
     ;;
   customize) exec "$REPO_ROOT/bin/install" --customize "$@" ;;
   update|upgrade) exec "$REPO_ROOT/bin/update" "$@" ;;
@@ -39,7 +38,7 @@ case "$command_name" in
     printf '%s\n' \
       'Usage: vedup [command]' '' \
       "Run \`vedup\` without arguments for the friendly menu." '' \
-      '  sync         Synchronize this machine' \
+      '  sync         Update Vedup when due, then synchronize this machine' \
       '  customize    Change selected components' \
       '  update       Download, verify, and activate the latest Vedup release' \
       '  save         Save local changes for future machines' \

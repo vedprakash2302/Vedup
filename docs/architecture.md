@@ -9,13 +9,17 @@ The friendly interface is `bin/install`; the automation engine is `bin/setup`.
 Both feed the same inventory and planner. `bin/vedup` is the stable command
 dispatcher installed into `~/.local/bin`.
 
-After the first installation, `vedup update` reads the published bootstrap's
-release metadata, downloads and verifies the immutable archive and its file
-manifest, and atomically advances the `current` CLI pointer. The separate
-`applied` pointer continues to supply Mise and shell policy until a successful
-sync advances it. Updating deliberately does not run setup or modify the machine;
-`vedup sync` is the separate configuration action. The long one-liner is only
-the initial bootstrap and recovery entry point.
+After the first installation, `vedup sync` performs a cached release check
+before it plans machine changes. The check runs at most once every 12 hours and
+uses short network timeouts. When a release is available, Vedup downloads and
+verifies the immutable archive and file manifest, advances the `current` CLI
+pointer, and continues the same command from the new release. The separate
+`applied` pointer continues to supply Mise and shell policy until the sync and
+health checks pass. A failed release check does not block synchronization with
+the installed release.
+
+`vedup update` provides the download-only form of the same verified update. The
+long one-liner is only the initial bootstrap and recovery entry point.
 
 Important data sources:
 

@@ -26,7 +26,7 @@ Supported platforms:
 Run `vedup` for the home menu. Direct commands are also available:
 
 ```bash
-vedup sync          # apply missing tools and managed configuration changes
+vedup sync          # update Vedup when due, then synchronize this machine
 vedup customize     # change saved bundles and application selections
 vedup update        # update only the Vedup CLI
 vedup save          # review local configuration/app changes for capture
@@ -35,9 +35,16 @@ vedup doctor        # diagnose the active installation
 vedup advanced      # high-impact macOS settings
 ```
 
-`vedup update` verifies an immutable release and advances only the CLI pointer.
-It never installs applications or changes the shell, dotfiles, runtimes, or
-system preferences. `vedup sync` is always a separate action.
+`vedup sync` checks for a release update at most once every 12 hours. When one
+is available, it downloads and verifies the immutable release before planning
+machine changes with the new version. A failed update check prints a warning
+and continues with the installed release. Use `--no-update` or `--offline` to
+skip the release check, or `--check-only` to check and exit. A dry run never
+downloads a release.
+
+`vedup update` remains available when you want to download and verify a release
+without synchronizing the machine. It advances only the CLI pointer. The
+`applied` pointer changes after a successful sync.
 
 ## What Vedup manages
 

@@ -9,7 +9,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPDATE_MODE=auto
 CHECK_ONLY=0
 DRY_RUN_REQUESTED=0
-SYNC_ARGS=()
+# macOS still ships Bash 3.2, where an empty array can trip `set -u`. Keep one
+# private sentinel and track the number of real arguments separately.
+SYNC_ARGS=("")
+SYNC_ARG_COUNT=0
 VEDUP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vedup"
 VEDUP_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/vedup"
 UPDATE_CHECK_FILE="$VEDUP_CACHE_HOME/update-check"
@@ -34,9 +37,9 @@ while [ "$#" -gt 0 ]; do
     --no-update) UPDATE_MODE=skip ;;
     --offline) UPDATE_MODE=skip ;;
     --check-only) CHECK_ONLY=1 ;;
-    --dry-run) DRY_RUN_REQUESTED=1; SYNC_ARGS+=("$1") ;;
+    --dry-run) DRY_RUN_REQUESTED=1; SYNC_ARGS+=("$1"); SYNC_ARG_COUNT=$((SYNC_ARG_COUNT + 1)) ;;
     -h|--help) usage; exit 0 ;;
-    *) SYNC_ARGS+=("$1") ;;
+    *) SYNC_ARGS+=("$1"); SYNC_ARG_COUNT=$((SYNC_ARG_COUNT + 1)) ;;
   esac
   shift
 done
@@ -105,11 +108,14 @@ if [ -L "$VEDUP_DATA_HOME/current" ]; then
 fi
 
 set +e
-if [ "${#SYNC_ARGS[@]}" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+if [ "$SYNC_ARG_COUNT" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
   "$EXECUTION_ROOT/bin/install"
   sync_status="$?"
+elif [ "$SYNC_ARG_COUNT" -eq 0 ]; then
+  "$EXECUTION_ROOT/bin/setup"
+  sync_status="$?"
 else
-  "$EXECUTION_ROOT/bin/setup" "${SYNC_ARGS[@]}"
+  "$EXECUTION_ROOT/bin/setup" "${SYNC_ARGS[@]:1}"
   sync_status="$?"
 fi
 set -e
